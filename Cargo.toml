@@ -1,0 +1,7 @@
+[package]
+name = "fhir-fuse"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fuser = { version = "0.16.0", features = ["libfuse"] }
