@@ -46,7 +46,7 @@ impl FhirFuse {
             patients: HashMap::new(),
             name_to_inode: HashMap::new(),
         };
-        if fhir_base_url == "offline" {
+        if fhir_base_url != "offline" {
             fs.refresh_patients();
         }
         fs
