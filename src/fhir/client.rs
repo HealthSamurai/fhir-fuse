@@ -7,13 +7,6 @@ pub fn put_to_fhir_server(
     let resource_id = filename.trim_end_matches(".json");
     let url = format!("{}/{}/{}", fhir_base_url, resource_type, resource_id);
 
-    println!(
-        "FHIR PUT: {}/{} ({} bytes)",
-        resource_type,
-        resource_id,
-        content.len()
-    );
-
     let client = reqwest::blocking::Client::new();
     let response = client
         .put(&url)
@@ -24,8 +17,10 @@ pub fn put_to_fhir_server(
     let status = response.status();
     let response_text = response.text()?;
 
+    println!("FHIR PUT {}/{} -> {}", resource_type, resource_id, status);
+    println!("{}", content);
+
     if status.is_success() {
-        println!("FHIR PUT: {}/{} -> {}", resource_type, resource_id, status);
         Ok(response_text)
     } else {
         Err(anyhow::anyhow!(
@@ -44,19 +39,18 @@ pub fn delete_from_fhir_server(
     let resource_id = filename.trim_end_matches(".json");
     let url = format!("{}/{}/{}", fhir_base_url, resource_type, resource_id);
 
-    println!("FHIR DELETE: {}/{}", resource_type, resource_id);
-
     let client = reqwest::blocking::Client::new();
     let response = client.delete(&url).send()?;
 
     let status = response.status();
     let response_text = response.text()?;
 
+    println!(
+        "FHIR DELETE {}/{} -> {}",
+        resource_type, resource_id, status
+    );
+
     if status.is_success() || status.as_u16() == 404 {
-        println!(
-            "FHIR DELETE: {}/{} -> {}",
-            resource_type, resource_id, status
-        );
         Ok(())
     } else {
         Err(anyhow::anyhow!(
