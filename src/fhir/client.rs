@@ -1,3 +1,35 @@
+pub fn get_from_fhir_server(
+    fhir_base_url: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> anyhow::Result<String> {
+    let url = format!(
+        "{}/{}/{}?_pretty=true",
+        fhir_base_url, resource_type, resource_id
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(&url)
+        .header("Accept", "application/fhir+json")
+        .send()?;
+
+    let status = response.status();
+    let response_text = response.text()?;
+
+    println!("FHIR GET {}/{} -> {}", resource_type, resource_id, status);
+
+    if status.is_success() {
+        Ok(response_text)
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to GET resource from FHIR server: HTTP {} - {}",
+            status,
+            response_text
+        ))
+    }
+}
+
 pub fn put_to_fhir_server(
     fhir_base_url: &str,
     resource_type: &str,
@@ -18,7 +50,6 @@ pub fn put_to_fhir_server(
     let response_text = response.text()?;
 
     println!("FHIR PUT {}/{} -> {}", resource_type, resource_id, status);
-    println!("{}", content);
 
     if status.is_success() {
         Ok(response_text)

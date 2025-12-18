@@ -180,11 +180,60 @@ impl Filesystem for FhirFuse {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if let Some(attr) = self.get_attrs(ino) {
-            reply.attr(&TTL, &attr);
-        } else {
-            println!("{}: getattr: not found", ino);
-            reply.error(ENOENT);
+        match self.inode_index.get(ino) {
+            Some(VFSEntry::FHIRResource(resource)) => {
+                // Fetch fresh metadata from the server
+                let resource_id = resource.filename.trim_end_matches(".json");
+                match fhir::get_from_fhir_server(
+                    &self.fhir_base_url,
+                    &resource.resource_type,
+                    resource_id,
+                ) {
+                    Ok(content) => {
+                        // Create FileAttr with actual content size
+                        let ts = std::time::SystemTime::now();
+                        let attr = FileAttr {
+                            ino: resource.inode,
+                            size: content.len() as u64,
+                            blocks: 1,
+                            atime: ts,
+                            mtime: ts,
+                            ctime: ts,
+                            crtime: ts,
+                            kind: fuser::FileType::RegularFile,
+                            perm: 0o644,
+                            nlink: 1,
+                            uid: 501,
+                            gid: 20,
+                            rdev: 0,
+                            flags: 0,
+                            blksize: 512,
+                        };
+                        reply.attr(&TTL, &attr);
+                    }
+                    Err(e) => {
+                        println!("{}: getattr: failed to fetch from server: {}", ino, e);
+                        // Fall back to cached attributes
+                        if let Some(attr) = self.get_attrs(ino) {
+                            reply.attr(&TTL, &attr);
+                        } else {
+                            reply.error(EIO);
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                // For non-FHIR resources, use cached attributes
+                if let Some(attr) = self.get_attrs(ino) {
+                    reply.attr(&TTL, &attr);
+                } else {
+                    reply.error(ENOENT);
+                }
+            }
+            None => {
+                println!("{}: getattr: not found", ino);
+                reply.error(ENOENT);
+            }
         }
     }
 
@@ -213,14 +262,40 @@ impl Filesystem for FhirFuse {
             }
             Some(VFSEntry::FHIRResource(resource)) => {
                 println!("{}: {}: read", ino, resource.filename);
-                let data = resource.read(offset, size);
-                println!(
-                    "{}: [{}]: read: {} bytes",
-                    ino,
-                    resource.filename,
-                    data.len()
-                );
-                reply.data(&data);
+
+                // Fetch the resource directly from the server
+                let resource_id = resource.filename.trim_end_matches(".json");
+                match fhir::get_from_fhir_server(
+                    &self.fhir_base_url,
+                    &resource.resource_type,
+                    resource_id,
+                ) {
+                    Ok(content) => {
+                        // Read the requested portion of the fresh content
+                        let content_bytes = content.as_bytes();
+                        let offset = offset as usize;
+                        let size = size as usize;
+
+                        let data = if offset < content_bytes.len() {
+                            let end = std::cmp::min(offset + size, content_bytes.len());
+                            content_bytes[offset..end].to_vec()
+                        } else {
+                            vec![]
+                        };
+
+                        println!(
+                            "{}: [{}]: read: {} bytes (fetched from server)",
+                            ino,
+                            resource.filename,
+                            data.len()
+                        );
+                        reply.data(&data);
+                    }
+                    Err(e) => {
+                        println!("{}: {}: read failed: {}", ino, resource.filename, e);
+                        reply.error(EIO);
+                    }
+                }
             }
             _ => {
                 println!("{}: read: not found", ino);

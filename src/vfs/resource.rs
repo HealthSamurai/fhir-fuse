@@ -51,19 +51,6 @@ impl FHIRResource {
         }
     }
 
-    pub fn read(&self, offset: i64, size: u32) -> Vec<u8> {
-        let content = self.content.as_bytes();
-        let offset = offset as usize;
-        let size = size as usize;
-
-        if offset < content.len() {
-            let end = std::cmp::min(offset + size, content.len());
-            content[offset..end].to_vec()
-        } else {
-            vec![]
-        }
-    }
-
     pub fn put_to_fhir_server(&self, fhir_base_url: &str) -> anyhow::Result<String> {
         fhir::put_to_fhir_server(
             fhir_base_url,
