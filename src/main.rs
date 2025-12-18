@@ -8,11 +8,17 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::time::{Duration, SystemTime};
 
+mod text_file;
+use text_file::TextFile;
+
 const TTL: Duration = Duration::from_secs(1);
 
 const ROOT_INODE: u64 = 1;
 const PATIENT_DIR_INODE: u64 = 2;
+const README_INODE: u64 = 3;
 const PATIENT_FILE_INODE_START: u64 = 100;
+
+const README_CONTENT: &str = include_str!("../assets/README.md");
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FhirBundle {
@@ -37,14 +43,20 @@ struct FhirFuse {
     fhir_base_url: String,
     patients: HashMap<u64, PatientFile>,
     name_to_inode: HashMap<String, u64>,
+    text_files: HashMap<u64, TextFile>,
 }
 
 impl FhirFuse {
     fn new(fhir_base_url: String) -> Self {
+        let mut text_files = HashMap::new();
+        let readme = TextFile::new(README_INODE, "README.md", README_CONTENT);
+        text_files.insert(README_INODE, readme);
+
         let mut fs = FhirFuse {
             fhir_base_url: fhir_base_url.clone(),
             patients: HashMap::new(),
             name_to_inode: HashMap::new(),
+            text_files,
         };
         if fhir_base_url != "offline" {
             fs.refresh_patients();
@@ -177,6 +189,12 @@ impl Filesystem for FhirFuse {
                         reply.entry(&TTL, &attr, 0);
                         return;
                     }
+                } else if let Some(text_file) =
+                    self.text_files.values().find(|f| f.name == name_str)
+                {
+                    let attr = text_file.get_attr();
+                    reply.entry(&TTL, &attr, 0);
+                    return;
                 }
             }
             PATIENT_DIR_INODE => {
@@ -194,7 +212,10 @@ impl Filesystem for FhirFuse {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if let Some(attr) = self.get_attrs(ino) {
+        if let Some(text_file) = self.text_files.get(&ino) {
+            let attr = text_file.get_attr();
+            reply.attr(&TTL, &attr);
+        } else if let Some(attr) = self.get_attrs(ino) {
             reply.attr(&TTL, &attr);
         } else {
             reply.error(ENOENT);
@@ -212,7 +233,10 @@ impl Filesystem for FhirFuse {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        if let Some(patient) = self.patients.get(&ino) {
+        if let Some(text_file) = self.text_files.get(&ino) {
+            let data = text_file.read(offset, size);
+            reply.data(&data);
+        } else if let Some(patient) = self.patients.get(&ino) {
             let content = patient.content.as_bytes();
             let offset = offset as usize;
             let size = size as usize;
@@ -238,14 +262,26 @@ impl Filesystem for FhirFuse {
     ) {
         match ino {
             ROOT_INODE => {
-                let entries = vec![
-                    (ROOT_INODE, FileType::Directory, "."),
-                    (ROOT_INODE, FileType::Directory, ".."),
-                    (PATIENT_DIR_INODE, FileType::Directory, "Patient"),
+                let mut entries = vec![
+                    (ROOT_INODE, FileType::Directory, ".".to_string()),
+                    (ROOT_INODE, FileType::Directory, "..".to_string()),
+                    (
+                        PATIENT_DIR_INODE,
+                        FileType::Directory,
+                        "Patient".to_string(),
+                    ),
                 ];
 
+                for text_file in self.text_files.values() {
+                    entries.push((
+                        text_file.inode,
+                        FileType::RegularFile,
+                        text_file.name.clone(),
+                    ));
+                }
+
                 for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                    if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
                         break;
                     }
                 }
