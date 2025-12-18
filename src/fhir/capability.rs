@@ -77,7 +77,7 @@ impl ServerCapabilities {
 
 pub fn fetch_capability_statement(fhir_base_url: &str) -> anyhow::Result<ServerCapabilities> {
     let url = format!("{}/metadata", fhir_base_url);
-    println!("Fetching capability statement from: {}", url);
+    println!("FHIR: fetching capability statement");
 
     let response = reqwest::blocking::get(&url)?;
 
@@ -100,9 +100,8 @@ pub fn fetch_capability_statement(fhir_base_url: &str) -> anyhow::Result<ServerC
     let capabilities = ServerCapabilities::from_capability_statement(capability_statement);
 
     println!(
-        "Found {} resource types: {:?}",
-        capabilities.resources.len(),
-        capabilities.resources
+        "FHIR: found {} resource types",
+        capabilities.resources.len()
     );
 
     Ok(capabilities)
@@ -119,7 +118,7 @@ pub fn fetch_resources(
         url = format!("{}?_count={}", url, count);
     }
 
-    println!("Fetching {} resources from: {}", resource_type, url);
+    println!("FHIR: fetching {}", resource_type);
 
     let response = reqwest::blocking::get(&url)?;
 

@@ -129,7 +129,7 @@ impl InodeIndex {
         self.get_children(parent).into_iter().find(|&child_inode| {
             match self.entries.get(&child_inode) {
                 Some(VFSEntry::Directory(dir)) => dir.name == name,
-                Some(VFSEntry::TextFile(file)) => file.name == name,
+                Some(VFSEntry::TextFile(file)) => file.filename == name,
                 Some(VFSEntry::FHIRResource(resource)) => resource.filename == name,
                 None => false,
             }

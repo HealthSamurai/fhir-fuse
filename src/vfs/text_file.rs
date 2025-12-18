@@ -4,7 +4,7 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct TextFile {
     pub inode: u64,
-    pub name: String,
+    pub filename: String,
     pub content: String,
 }
 
@@ -12,7 +12,7 @@ impl TextFile {
     pub fn new(inode: u64, name: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             inode,
-            name: name.into(),
+            filename: name.into(),
             content: content.into(),
         }
     }

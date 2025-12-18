@@ -55,7 +55,6 @@ impl FhirFuse {
                 println!("Successfully fetched capabilities");
                 for resource_type in &caps.resources {
                     let dir_inode = inode_allocator.allocate();
-                    println!("inode {} <- {}", dir_inode, resource_type);
                     inode_index.insert_directory(Directory::new(dir_inode, resource_type.clone()));
                     inode_index.add_parent_child_relation(root_inode, dir_inode);
                     resource_directories.insert(resource_type.clone(), dir_inode);
@@ -79,8 +78,8 @@ impl FhirFuse {
         fs
     }
 
-    fn ensure_resources_loaded(&mut self, resource_type: &str, force: bool) {
-        if !self.loaded_resources.contains(resource_type) || force {
+    fn ensure_resources_loaded(&mut self, resource_type: &str, force_refresh: bool) {
+        if force_refresh || !self.loaded_resources.contains(resource_type) {
             self.refresh_resources(resource_type);
             self.loaded_resources.insert(resource_type.to_string());
         }
@@ -88,7 +87,6 @@ impl FhirFuse {
 
     fn refresh_resources(&mut self, resource_type: &str) {
         println!("Fetching {} resources from FHIR server...", resource_type);
-
         match fetch_resources(&self.fhir_base_url, resource_type, Some(100)) {
             Ok(resources) => {
                 // Clear old resources of this type
@@ -117,7 +115,7 @@ impl FhirFuse {
                 println!("Loaded {} {} resources", count, resource_type);
             }
             Err(e) => {
-                eprintln!("Failed to fetch {} resources: {:#?}", resource_type, e);
+                println!("0: [{}]: refresh: failed: {}", resource_type, e);
             }
         }
     }
@@ -144,6 +142,7 @@ impl FhirFuse {
 impl Filesystem for FhirFuse {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_str().unwrap_or("");
+        println!("{}:\tlookup", name_str);
 
         match parent {
             parent if parent == self.inode_allocator.root_inode => {
@@ -164,7 +163,7 @@ impl Filesystem for FhirFuse {
 
                 if let Some(resource_type) = matching_resource {
                     // Load resources on first access
-                    self.ensure_resources_loaded(&resource_type, true);
+                    self.ensure_resources_loaded(&resource_type, false);
 
                     if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
                     {
@@ -184,6 +183,7 @@ impl Filesystem for FhirFuse {
         if let Some(attr) = self.get_attrs(ino) {
             reply.attr(&TTL, &attr);
         } else {
+            println!("{}: getattr: not found", ino);
             reply.error(ENOENT);
         }
     }
@@ -196,19 +196,36 @@ impl Filesystem for FhirFuse {
         offset: i64,
         size: u32,
         _flags: i32,
-        _lock: Option<u64>,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         match self.inode_index.get(ino) {
             Some(VFSEntry::TextFile(text_file)) => {
+                println!("{}: {}: read", ino, text_file.filename);
                 let data = text_file.read(offset, size);
+                println!(
+                    "{}: [{}]: read: {} bytes",
+                    ino,
+                    text_file.filename,
+                    data.len()
+                );
                 reply.data(&data);
             }
             Some(VFSEntry::FHIRResource(resource)) => {
+                println!("{}: {}: read", ino, resource.filename);
                 let data = resource.read(offset, size);
+                println!(
+                    "{}: [{}]: read: {} bytes",
+                    ino,
+                    resource.filename,
+                    data.len()
+                );
                 reply.data(&data);
             }
-            _ => reply.error(ENOENT),
+            _ => {
+                println!("{}: read: not found", ino);
+                reply.error(ENOENT);
+            }
         }
     }
 
@@ -221,6 +238,7 @@ impl Filesystem for FhirFuse {
         mut reply: ReplyDirectory,
     ) {
         if ino == self.inode_allocator.root_inode {
+            println!("{}: ROOT: readdir", ino);
             let mut listing = DirectoryListing::new();
             listing.add_current_dir(self.inode_allocator.root_inode);
             listing.add_parent_dir(self.inode_allocator.root_inode);
@@ -233,7 +251,7 @@ impl Filesystem for FhirFuse {
                 if let Some(entry) = self.inode_index.get(child_inode) {
                     match entry {
                         VFSEntry::Directory(dir) => listing.add_dir(dir.inode, &dir.name),
-                        VFSEntry::TextFile(file) => listing.add_file(file.inode, &file.name),
+                        VFSEntry::TextFile(file) => listing.add_file(file.inode, &file.filename),
                         _ => {}
                     }
                 }
@@ -255,6 +273,7 @@ impl Filesystem for FhirFuse {
             .find(|(_, &dir_inode)| ino == dir_inode)
             .map(|(resource_type, &dir_inode)| (resource_type.clone(), dir_inode))
         {
+            println!("{}: {}: readdir", ino, resource_type);
             // Load resources on first access
             self.ensure_resources_loaded(&resource_type, true);
 
@@ -312,15 +331,7 @@ impl Filesystem for FhirFuse {
             .map(|(resource_type, _)| resource_type.clone());
 
         if let Some(resource_type) = matching_resource {
-            println!("=== File Creation ===");
-            println!("Resource Type: {}", resource_type);
-            println!("Filename: {}", name_str);
-
-            if name_str.ends_with(".json") {
-                let resource_id = name_str.trim_end_matches(".json");
-                println!("Resource ID: {}", resource_id);
-                println!("Full path: /{}/{}", resource_type, name_str);
-            }
+            // Creating a new resource file
 
             // Allocate a new inode for this file
             let inode = self.inode_allocator.allocate();
@@ -366,8 +377,7 @@ impl Filesystem for FhirFuse {
                 blksize: 512,
             };
 
-            println!("Created file with inode: {}", inode);
-            println!("=============================");
+            println!("{}: [{}]: create: resource file", inode, name_str);
 
             // Return success with the file handle being the same as inode
             reply.created(&TTL, &attr, 0, inode, 0);
@@ -404,74 +414,31 @@ impl Filesystem for FhirFuse {
             // Write data at the specified offset
             content[offset..offset + data.len()].copy_from_slice(data);
 
-            println!("=== File Write ===");
-            println!("Inode: {}", ino);
-            println!("Offset: {}", offset);
-            println!("Size: {} bytes", data.len());
-
-            // Try to parse as JSON and print prettily
-            if let Ok(text) = std::str::from_utf8(content) {
-                println!("Content Preview:");
-                println!("{}", text);
-
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-                    println!("Valid JSON detected:");
-                    if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                        println!("{}", pretty);
-                    }
-                }
-            }
-            println!("==================");
+            println!("{}: write: offset={} size={}", ino, offset, data.len());
 
             reply.written(data.len() as u32);
         } else {
-            println!("Write attempt to unknown inode: {}", ino);
+            println!("{}: write: unknown inode", ino);
             reply.error(ENOENT);
         }
     }
 
     fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        println!("=== File Flush ===");
-        println!("Inode: {}", ino);
-
         // Check if this is a created file that needs to be pushed to the server
-        if let Some((resource_type, filename)) = self.created_files.get(&ino) {
+        if let Some((_resource_type, filename)) = self.created_files.get(&ino) {
             if let Some(content) = self.pending_writes.get(&ino) {
-                if let Ok(text) = std::str::from_utf8(content) {
-                    println!("Final content ({} bytes):", content.len());
-                    println!("{}", text);
-
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-                        println!("\nParsed as valid JSON:");
-                        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                            println!("{}", pretty);
+                if let Ok(_text) = std::str::from_utf8(content) {
+                    if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(ino) {
+                        match resource.put_to_fhir_server(&self.fhir_base_url) {
+                            Ok(_response) => {
+                                println!("{}: [{}]: flush: pushed to FHIR", ino, filename);
+                            }
+                            Err(e) => {
+                                println!("{}: [{}]: flush: FHIR push failed: {}", ino, filename, e);
+                            }
                         }
-
-                        // Extract resource type and ID if present
-                        if let Some(resource_type) =
-                            json.get("resourceType").and_then(|v| v.as_str())
-                        {
-                            println!("\nResource Type: {}", resource_type);
-                        }
-                        if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
-                            println!("Resource ID: {}", id);
-                        }
-                    }
-
-                    // Send to FHIR server
-                    println!("\nPushing to FHIR server...");
-                    match fhir::put_to_fhir_server(
-                        &self.fhir_base_url,
-                        resource_type,
-                        filename,
-                        text,
-                    ) {
-                        Ok(_response) => {
-                            println!("Successfully pushed to FHIR server");
-                        }
-                        Err(e) => {
-                            println!("Failed to push to FHIR server: {}", e);
-                        }
+                    } else {
+                        println!("{}: [{}]: flush: not a FHIR resource", ino, filename);
                     }
                 }
             }
@@ -512,20 +479,12 @@ impl Filesystem for FhirFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        println!("=== File Release ===");
-        println!("Inode: {}", ino);
-
-        // Clean up pending writes for this inode
-        if self.pending_writes.remove(&ino).is_some() {
-            println!("Cleaned up pending writes for inode {}", ino);
-        }
+        // Clean up pending writes if they exist
+        self.pending_writes.remove(&ino);
 
         // Clean up created files tracking
-        if self.created_files.remove(&ino).is_some() {
-            println!("Cleaned up created file tracking for inode {}", ino);
-        }
+        self.created_files.remove(&ino);
 
-        println!("====================");
         reply.ok();
     }
 
@@ -598,7 +557,7 @@ impl Filesystem for FhirFuse {
                 // If this is a pending write, truncate the buffer
                 if let Some(content) = self.pending_writes.get_mut(&ino) {
                     content.resize(new_size as usize, 0);
-                    println!("Truncated pending write buffer to {} bytes", new_size);
+                    println!("{}: setattr: truncate to {}", ino, new_size);
                 }
             }
 
@@ -607,74 +566,65 @@ impl Filesystem for FhirFuse {
                 attr.perm = new_mode as u16;
             }
 
-            println!("Updated attributes for inode {}", ino);
-            println!("======================");
             reply.attr(&TTL, &attr);
         } else {
-            println!("Inode {} not found", ino);
-            println!("======================");
+            println!("{}: setattr: not found", ino);
             reply.error(ENOENT);
         }
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        println!("=== File Unlink (Delete) ===");
         let name_str = name.to_str().unwrap_or("");
-        println!("Parent inode: {}, Name: {}", parent, name_str);
 
-        // Find the inode of the file to delete
-        if let Some(file_inode) = self.inode_index.find_child_by_name(parent, name_str) {
-            println!("Found file inode: {}", file_inode);
+        // Check if this is a resource directory and might need server deletion
+        let mut server_delete_needed = false;
 
-            // Determine if this is a resource file that needs server deletion
-            let mut server_delete_needed = false;
-            let mut resource_type = String::new();
-
-            // Check if the parent is a resource directory
-            for (res_type, &dir_inode) in &self.resource_directories {
-                if dir_inode == parent {
-                    resource_type = res_type.clone();
-                    server_delete_needed = true;
-                    break;
-                }
+        for (_res_type, &dir_inode) in &self.resource_directories {
+            if dir_inode == parent {
+                server_delete_needed = true;
+                break;
             }
+        }
 
+        // Find the inode of the file to delete (if it exists in our index)
+        let file_inode = self.inode_index.find_child_by_name(parent, name_str);
+
+        if let Some(inode) = file_inode {
             // Delete from FHIR server if it's a resource file
             if server_delete_needed && name_str.ends_with(".json") {
-                println!("Deleting resource from FHIR server...");
-                match fhir::delete_from_fhir_server(&self.fhir_base_url, &resource_type, name_str) {
-                    Ok(_) => {
-                        println!("✓ Deleted from FHIR server");
+                // Try to get the FHIRResource from the index and use its method
+                if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(inode) {
+                    match resource.delete_from_fhir_server(&self.fhir_base_url) {
+                        Ok(_) => {
+                            println!("{}: [{}]: unlink: deleted from FHIR", inode, name_str);
+                        }
+                        Err(e) => {
+                            println!(
+                                "{}: [{}]: unlink: FHIR delete failed: {}",
+                                inode, name_str, e
+                            );
+                            reply.error(EIO);
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        println!("✗ Failed to delete from FHIR server: {}", e);
-                        println!("======================");
-                        reply.error(EIO);
-                        return;
-                    }
+                } else {
+                    println!("{}: [{}]: unlink: not a FHIR resource", inode, name_str);
                 }
             }
 
             // Remove from pending writes if present
-            if self.pending_writes.remove(&file_inode).is_some() {
-                println!("Removed from pending_writes");
-            }
+            self.pending_writes.remove(&inode);
 
-            // Remove from created files if present
-            if self.created_files.remove(&file_inode).is_some() {
-                println!("Removed from created_files");
-            }
+            // Remove from created_files if present
+            self.created_files.remove(&inode);
 
-            // Remove from inode index (this handles all the internal cleanup)
-            self.inode_index.remove(file_inode);
-            println!("Removed from inode index");
+            // Remove from the index
+            self.inode_index.remove(inode);
 
-            println!("✓ File deleted successfully");
-            println!("======================");
+            println!("{}: [{}]: unlink: deleted", inode, name_str);
             reply.ok();
         } else {
-            println!("File not found");
-            println!("======================");
+            println!("0: [{}]: unlink: not found in parent {}", name_str, parent);
             reply.error(ENOENT);
         }
     }

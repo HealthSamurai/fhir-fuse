@@ -1,3 +1,4 @@
+use crate::fhir;
 use fuser::FileAttr;
 use std::time::SystemTime;
 
@@ -61,5 +62,18 @@ impl FHIRResource {
         } else {
             vec![]
         }
+    }
+
+    pub fn put_to_fhir_server(&self, fhir_base_url: &str) -> anyhow::Result<String> {
+        fhir::put_to_fhir_server(
+            fhir_base_url,
+            &self.resource_type,
+            &self.filename,
+            &self.content,
+        )
+    }
+
+    pub fn delete_from_fhir_server(&self, fhir_base_url: &str) -> anyhow::Result<()> {
+        fhir::delete_from_fhir_server(fhir_base_url, &self.resource_type, &self.filename)
     }
 }
