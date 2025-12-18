@@ -10,6 +10,7 @@ help:
 	@echo "  make run-native     - Run the native macOS release binary"
 	@echo "  make clean          - Clean build artifacts"
 	@echo "  make test           - Run tests"
+	@echo "  make test-linux-musl-arm64 - Run tests for Linux ARM64 musl (Alpine)"
 	@echo "  make check          - Check code without building"
 	@echo "  make fmt            - Format code with rustfmt"
 	@echo "  make lint           - Run clippy linter"
@@ -52,6 +53,17 @@ clean:
 
 test:
 	cargo test
+
+test-linux-musl-arm64:
+	@echo "Testing for Linux ARM64 musl (Alpine Linux compatible) (using Docker)..."
+	docker run --rm --platform linux/arm64 \
+		-v "$(PWD)":/workspace \
+		-v cargo-cache-musl-arm64:/usr/local/cargo/registry \
+		-v cargo-git-cache-musl-arm64:/usr/local/cargo/git \
+		-w /workspace \
+		rust:alpine \
+		sh -c "apk add --no-cache fuse-dev fuse-static pkgconfig && cargo test"
+	@echo "✅ Tests completed for Linux ARM64 musl"
 
 check:
 	cargo check
@@ -188,4 +200,3 @@ clean-cache:
 	else \
 		echo "Cancelled"; \
 	fi
-

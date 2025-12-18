@@ -11,12 +11,10 @@ use std::time::{Duration, SystemTime};
 mod text_file;
 use text_file::TextFile;
 
-const TTL: Duration = Duration::from_secs(1);
+mod inode_allocator;
+use inode_allocator::InodeAllocator;
 
-const ROOT_INODE: u64 = 1;
-const PATIENT_DIR_INODE: u64 = 2;
-const README_INODE: u64 = 3;
-const PATIENT_FILE_INODE_START: u64 = 100;
+const TTL: Duration = Duration::from_secs(1);
 
 const README_CONTENT: &str = include_str!("../assets/README.md");
 
@@ -44,19 +42,33 @@ struct FhirFuse {
     patients: HashMap<u64, PatientFile>,
     name_to_inode: HashMap<String, u64>,
     text_files: HashMap<u64, TextFile>,
+    inode_allocator: InodeAllocator,
+    root_inode: u64,
+    patient_dir_inode: u64,
+    readme_inode: u64,
 }
 
 impl FhirFuse {
     fn new(fhir_base_url: String) -> Self {
+        let mut inode_allocator = InodeAllocator::new(1);
+
+        let root_inode = inode_allocator.allocate();
+        let patient_dir_inode = inode_allocator.allocate();
+        let readme_inode = inode_allocator.allocate();
+
         let mut text_files = HashMap::new();
-        let readme = TextFile::new(README_INODE, "README.md", README_CONTENT);
-        text_files.insert(README_INODE, readme);
+        let readme = TextFile::new(readme_inode, "README.md", README_CONTENT);
+        text_files.insert(readme_inode, readme);
 
         let mut fs = FhirFuse {
             fhir_base_url: fhir_base_url.clone(),
             patients: HashMap::new(),
             name_to_inode: HashMap::new(),
             text_files,
+            inode_allocator,
+            root_inode,
+            patient_dir_inode,
+            readme_inode,
         };
         if fhir_base_url != "offline" {
             fs.refresh_patients();
@@ -72,8 +84,8 @@ impl FhirFuse {
                 self.patients.clear();
                 self.name_to_inode.clear();
 
-                for (idx, patient) in patients.into_iter().enumerate() {
-                    let inode = PATIENT_FILE_INODE_START + idx as u64;
+                for patient in patients {
+                    let inode = self.inode_allocator.allocate();
                     let id = patient["id"].as_str().unwrap_or("unknown");
                     let filename = format!("{}.json", id);
                     let content = serde_json::to_string_pretty(&patient).unwrap_or_default();
@@ -117,8 +129,8 @@ impl FhirFuse {
         let ts = SystemTime::now();
 
         match inode {
-            ROOT_INODE => Some(FileAttr {
-                ino: ROOT_INODE,
+            inode if inode == self.root_inode => Some(FileAttr {
+                ino: self.root_inode,
                 size: 0,
                 blocks: 0,
                 atime: ts,
@@ -134,8 +146,8 @@ impl FhirFuse {
                 flags: 0,
                 blksize: 512,
             }),
-            PATIENT_DIR_INODE => Some(FileAttr {
-                ino: PATIENT_DIR_INODE,
+            inode if inode == self.patient_dir_inode => Some(FileAttr {
+                ino: self.patient_dir_inode,
                 size: 0,
                 blocks: 0,
                 atime: ts,
@@ -183,9 +195,9 @@ impl Filesystem for FhirFuse {
         let name_str = name.to_str().unwrap_or("");
 
         match parent {
-            ROOT_INODE => {
+            parent if parent == self.root_inode => {
                 if name_str == "Patient" {
-                    if let Some(attr) = self.get_attrs(PATIENT_DIR_INODE) {
+                    if let Some(attr) = self.get_attrs(self.patient_dir_inode) {
                         reply.entry(&TTL, &attr, 0);
                         return;
                     }
@@ -197,7 +209,7 @@ impl Filesystem for FhirFuse {
                     return;
                 }
             }
-            PATIENT_DIR_INODE => {
+            parent if parent == self.patient_dir_inode => {
                 if let Some(&inode) = self.name_to_inode.get(name_str) {
                     if let Some(attr) = self.get_attrs(inode) {
                         reply.entry(&TTL, &attr, 0);
@@ -261,12 +273,12 @@ impl Filesystem for FhirFuse {
         mut reply: ReplyDirectory,
     ) {
         match ino {
-            ROOT_INODE => {
+            ino if ino == self.root_inode => {
                 let mut entries = vec![
-                    (ROOT_INODE, FileType::Directory, ".".to_string()),
-                    (ROOT_INODE, FileType::Directory, "..".to_string()),
+                    (self.root_inode, FileType::Directory, ".".to_string()),
+                    (self.root_inode, FileType::Directory, "..".to_string()),
                     (
-                        PATIENT_DIR_INODE,
+                        self.patient_dir_inode,
                         FileType::Directory,
                         "Patient".to_string(),
                     ),
@@ -287,10 +299,10 @@ impl Filesystem for FhirFuse {
                 }
                 reply.ok();
             }
-            PATIENT_DIR_INODE => {
+            ino if ino == self.patient_dir_inode => {
                 let mut entries = vec![
-                    (PATIENT_DIR_INODE, FileType::Directory, ".".to_string()),
-                    (ROOT_INODE, FileType::Directory, "..".to_string()),
+                    (self.patient_dir_inode, FileType::Directory, ".".to_string()),
+                    (self.root_inode, FileType::Directory, "..".to_string()),
                 ];
 
                 for patient in self.patients.values() {

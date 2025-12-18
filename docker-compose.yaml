@@ -75,10 +75,11 @@ services:
     environment:
       FHIR_SERVER_URL: http://aidbox:8080/fhir
       MOUNT_POINT: /mnt/fhir
-    volumes:
-      - type: bind
-        source: ${MOUNT_DIR:-./mnt}
-        target: /mnt/fhir
-        bind:
-          propagation: rshared
-    command: ["/usr/local/bin/fhir-fuse", "/mnt/fhir", "http://aidbox:8080/fhir"]
+    # volumes:
+    #   - type: bind
+    #     source: ${MOUNT_DIR:-./mnt}
+    #     target: /mnt/fhir
+    #     bind:
+    #       propagation: rshared
+    command:
+      ["/usr/local/bin/fhir-fuse", "/mnt/fhir", "http://aidbox:8080/fhir"]
