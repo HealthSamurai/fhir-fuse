@@ -48,7 +48,7 @@ Create folder in resource type directory with the search query as the folder nam
 ```
 ./mnt/                                       # Mount point
 ├── ResourceType
-│   ├── ?search/
+│   ├── _search/
 │   │   └── search=query/
 │   │       ├── Some-resource-type/
 │   │       │   ├── Some-resource-type-id-1.json  # Resource version 1
@@ -61,7 +61,7 @@ Create folder in resource type directory with the search query as the folder nam
 │       ├── ResourceType-version-id-1.json    # Resource version 1
 │       └── ResourceType-version-id-2.json    # Resource version 2
 ├── Observation
-|   ├── ?search/
+|   ├── _search/
 |   |   └── _include=Observation:patient&_include:iterate=Patient:link/
 │   │       ├── Observation/
 │   │       │   ├── observation-id-1.json         # Resource version 1

@@ -1,6 +1,7 @@
 use super::directory::Directory;
 use super::resource::FHIRResource;
 use super::search::Search;
+use super::search_query::{SearchQuery, SearchResultGroup};
 use super::text_file::TextFile;
 use std::collections::HashMap;
 
@@ -10,6 +11,8 @@ pub enum VFSEntry {
     TextFile(TextFile),
     FHIRResource(FHIRResource),
     Search(Search),
+    SearchQuery(SearchQuery),
+    SearchResultGroup(SearchResultGroup),
 }
 
 #[derive(Debug)]
@@ -42,6 +45,16 @@ impl InodeIndex {
     pub fn insert_search(&mut self, search: Search) {
         let inode = search.inode;
         self.entries.insert(inode, VFSEntry::Search(search));
+    }
+
+    pub fn insert_search_query(&mut self, query: SearchQuery) {
+        let inode = query.inode;
+        self.entries.insert(inode, VFSEntry::SearchQuery(query));
+    }
+
+    pub fn insert_search_result_group(&mut self, group: SearchResultGroup) {
+        let inode = group.inode;
+        self.entries.insert(inode, VFSEntry::SearchResultGroup(group));
     }
 
     pub fn insert_resource(&mut self, resource: FHIRResource) {
@@ -104,8 +117,17 @@ impl InodeIndex {
 
     pub fn clear_resources_by_type(&mut self, resource_type: &str) {
         if let Some(inodes) = self.resource_type_index.remove(resource_type) {
-            for inode in inodes {
-                self.entries.remove(&inode);
+            // Create a set of inodes to remove for efficient lookup
+            let inodes_set: std::collections::HashSet<u64> = inodes.iter().copied().collect();
+
+            // Remove entries
+            for inode in &inodes {
+                self.entries.remove(inode);
+            }
+
+            // Remove from parent-child relations
+            for children in self.parent_child_index.values_mut() {
+                children.retain(|child| !inodes_set.contains(child));
             }
         }
     }
@@ -124,12 +146,18 @@ impl InodeIndex {
             .unwrap_or_default()
     }
 
+    pub fn clear_children(&mut self, parent: u64) {
+        self.parent_child_index.remove(&parent);
+    }
+
     pub fn get_attr(&self, inode: u64) -> Option<fuser::FileAttr> {
         self.entries.get(&inode).map(|entry| match entry {
             VFSEntry::Directory(dir) => dir.get_attr(),
             VFSEntry::TextFile(file) => file.get_attr(),
             VFSEntry::FHIRResource(resource) => resource.get_attr(),
             VFSEntry::Search(search) => search.get_attr(),
+            VFSEntry::SearchQuery(query) => query.get_attr(),
+            VFSEntry::SearchResultGroup(group) => group.get_attr(),
         })
     }
 
@@ -140,6 +168,8 @@ impl InodeIndex {
                 Some(VFSEntry::TextFile(file)) => file.filename == name,
                 Some(VFSEntry::FHIRResource(resource)) => resource.filename == name,
                 Some(VFSEntry::Search(search)) => search.name == name,
+                Some(VFSEntry::SearchQuery(query)) => query.query == name,
+                Some(VFSEntry::SearchResultGroup(group)) => group.resource_type == name,
                 None => false,
             }
         })
@@ -159,6 +189,8 @@ impl InodeIndex {
                 VFSEntry::TextFile(_) => stats.text_files += 1,
                 VFSEntry::FHIRResource(_) => stats.resources += 1,
                 VFSEntry::Search(_) => stats.search += 1,
+                VFSEntry::SearchQuery(_) => stats.search_queries += 1,
+                VFSEntry::SearchResultGroup(_) => stats.search_result_groups += 1,
             }
         }
         stats.total = self.entries.len();
@@ -174,14 +206,17 @@ pub struct IndexStats {
     pub text_files: usize,
     pub resources: usize,
     pub search: usize,
+    pub search_queries: usize,
+    pub search_result_groups: usize,
 }
 
 impl std::fmt::Display for IndexStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Total: {}, Directories: {}, Text Files: {}, Resources: {}, Search: {}",
-            self.total, self.directories, self.text_files, self.resources, self.search
+            "Total: {}, Directories: {}, Text Files: {}, Resources: {}, Search: {}, Queries: {}, Groups: {}",
+            self.total, self.directories, self.text_files, self.resources, self.search,
+            self.search_queries, self.search_result_groups
         )
     }
 }

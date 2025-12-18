@@ -12,11 +12,15 @@ use tokio::runtime::Runtime;
 
 mod vfs;
 use vfs::{
-    Directory, DirectoryListing, FHIRResource, IndexStats, InodeIndex, Search, TextFile, VFSEntry,
+    Directory, DirectoryListing, FHIRResource, IndexStats, InodeIndex, Search, SearchQuery,
+    SearchResultGroup, TextFile, VFSEntry,
 };
 
 mod fhir;
-use fhir::{delete_from_fhir_server, fetch_capability_statement, fetch_resources_parallel, put_to_fhir_server};
+use fhir::{
+    delete_from_fhir_server, fetch_capability_statement, fetch_resources_parallel,
+    put_to_fhir_server, search_fhir_resources,
+};
 
 mod inode_allocator;
 use inode_allocator::InodeAllocator;
@@ -33,7 +37,11 @@ struct FhirFuse {
     runtime: Arc<Runtime>,
     inode_index: InodeIndex,
     resource_directories: HashMap<String, u64>,
-    search_directories: HashMap<u64, u64>,
+    search_directories: HashMap<u64, u64>,        // search_inode -> readme_inode
+    search_query_directories: HashMap<u64, u64>,  // query_inode -> search_inode
+    search_result_groups: HashMap<u64, u64>,      // group_inode -> query_inode
+    search_query_info: HashMap<u64, (String, String)>, // query_inode -> (resource_type, query_string)
+    search_query_load_times: HashMap<u64, std::time::Instant>, // query_inode -> last_refresh_time
     loaded_resources: HashSet<String>,
     resource_load_times: HashMap<String, std::time::Instant>,
     inode_allocator: InodeAllocator,
@@ -114,6 +122,10 @@ impl FhirFuse {
             inode_index,
             resource_directories,
             search_directories,
+            search_query_directories: HashMap::new(),
+            search_result_groups: HashMap::new(),
+            search_query_info: HashMap::new(),
+            search_query_load_times: HashMap::new(),
             loaded_resources: HashSet::new(),
             resource_load_times: HashMap::new(),
             inode_allocator,
@@ -187,6 +199,101 @@ impl FhirFuse {
         self.inode_index.get_attr(inode)
     }
 
+    /// Refresh search results for a given query inode (only if cache expired)
+    fn refresh_search_query(&mut self, query_inode: u64) {
+        // Check if we need to refresh (cache duration)
+        let should_refresh = self
+            .search_query_load_times
+            .get(&query_inode)
+            .map(|t| t.elapsed() > CACHE_DURATION)
+            .unwrap_or(true);
+
+        if !should_refresh {
+            return;
+        }
+
+        let search_info = self.search_query_info.get(&query_inode).cloned();
+        if let Some((resource_type, query_string)) = search_info {
+            println!("[Search] Refreshing: {}/{}?{}", resource_type, "_search", query_string);
+
+            let client = self.http_client.clone();
+            let base_url = self.fhir_base_url.clone();
+            let rt_clone = resource_type.clone();
+            let query_clone = query_string.clone();
+
+            let result = self.runtime.block_on(async {
+                search_fhir_resources(&client, &base_url, &rt_clone, &query_clone).await
+            });
+
+            match result {
+                Ok(grouped_resources) => {
+                    // Build a map of existing groups by resource type
+                    let mut existing_groups: HashMap<String, u64> = HashMap::new();
+                    let old_children = self.inode_index.get_children(query_inode);
+                    for child_inode in &old_children {
+                        if let Some(VFSEntry::SearchResultGroup(group)) = self.inode_index.get(*child_inode) {
+                            existing_groups.insert(group.resource_type.clone(), *child_inode);
+                        }
+                    }
+
+                    // Update each group - reuse existing group inodes, only refresh resources
+                    for (res_type, resources) in grouped_resources {
+                        let group_inode = if let Some(&existing_inode) = existing_groups.get(&res_type) {
+                            // Clear old resources from this group
+                            let resource_children = self.inode_index.get_children(existing_inode);
+                            for res_inode in resource_children {
+                                self.inode_index.remove(res_inode);
+                            }
+                            self.inode_index.clear_children(existing_inode);
+                            existing_groups.remove(&res_type);
+                            existing_inode
+                        } else {
+                            // Create new group
+                            let new_inode = self.inode_allocator.allocate();
+                            let group = SearchResultGroup::new(
+                                new_inode,
+                                res_type.clone(),
+                                query_inode,
+                            );
+                            self.inode_index.insert_search_result_group(group);
+                            self.inode_index.add_parent_child_relation(query_inode, new_inode);
+                            self.search_result_groups.insert(new_inode, query_inode);
+                            new_inode
+                        };
+
+                        // Add fresh resources to the group
+                        for resource in &resources {
+                            let res_inode = self.inode_allocator.allocate();
+                            let id = resource["id"].as_str().unwrap_or("unknown");
+                            let content = serde_json::to_string_pretty(&resource).unwrap_or_default();
+
+                            let resource_entry = FHIRResource::new(res_inode, &res_type, id, content);
+                            self.inode_index.insert_resource(resource_entry);
+                            self.inode_index.add_parent_child_relation(group_inode, res_inode);
+                        }
+                    }
+
+                    // Remove groups that no longer exist in results
+                    for (_res_type, old_group_inode) in existing_groups {
+                        let resource_children = self.inode_index.get_children(old_group_inode);
+                        for res_inode in resource_children {
+                            self.inode_index.remove(res_inode);
+                        }
+                        self.inode_index.clear_children(old_group_inode);
+                        self.search_result_groups.remove(&old_group_inode);
+                        self.inode_index.remove(old_group_inode);
+                    }
+
+                    // Update cache time
+                    self.search_query_load_times.insert(query_inode, std::time::Instant::now());
+                }
+                Err(e) => {
+                    println!("[Search] Refresh failed: {}", e);
+                }
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn debug_print_stats(&self) {
         let stats: IndexStats = self.inode_index.stats();
@@ -235,7 +342,30 @@ impl Filesystem for FhirFuse {
                     }
                 }
 
+                // Handle _search directories
                 if self.search_directories.contains_key(&parent) {
+                    if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
+                    {
+                        if let Some(attr) = self.get_attrs(child_inode) {
+                            reply.entry(&TTL, &attr, 0);
+                            return;
+                        }
+                    }
+                }
+
+                // Handle SearchQuery directories (search results grouped by type)
+                if self.search_query_directories.contains_key(&parent) {
+                    if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
+                    {
+                        if let Some(attr) = self.get_attrs(child_inode) {
+                            reply.entry(&TTL, &attr, 0);
+                            return;
+                        }
+                    }
+                }
+
+                // Handle SearchResultGroup directories (resources within a type group)
+                if self.search_result_groups.contains_key(&parent) {
                     if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
                     {
                         if let Some(attr) = self.get_attrs(child_inode) {
@@ -277,7 +407,12 @@ impl Filesystem for FhirFuse {
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.inode_index.get(ino) {
-            Some(VFSEntry::FHIRResource(_)) | Some(VFSEntry::Directory(_)) | Some(VFSEntry::TextFile(_)) | Some(VFSEntry::Search(_)) => {
+            Some(VFSEntry::FHIRResource(_))
+            | Some(VFSEntry::Directory(_))
+            | Some(VFSEntry::TextFile(_))
+            | Some(VFSEntry::Search(_))
+            | Some(VFSEntry::SearchQuery(_))
+            | Some(VFSEntry::SearchResultGroup(_)) => {
                 if let Some(attr) = self.get_attrs(ino) {
                     reply.attr(&TTL, &attr);
                 } else {
@@ -387,6 +522,7 @@ impl Filesystem for FhirFuse {
             return;
         }
 
+        // Handle _search directories (show README and any SearchQuery entries)
         if self.search_directories.contains_key(&ino) {
             let mut listing = DirectoryListing::new();
             listing.add_current_dir(ino);
@@ -397,9 +533,82 @@ impl Filesystem for FhirFuse {
 
             let children = self.inode_index.get_children(ino);
             for &child_inode in &children {
-                if let Some(VFSEntry::TextFile(file)) = self.inode_index.get(child_inode) {
-                    listing.add_file(file.inode, &file.filename);
+                match self.inode_index.get(child_inode) {
+                    Some(VFSEntry::TextFile(file)) => {
+                        listing.add_file(file.inode, &file.filename);
+                    }
+                    Some(VFSEntry::SearchQuery(query)) => {
+                        listing.add_dir(query.inode, &query.query);
+                    }
+                    _ => {}
                 }
+            }
+
+            let entries = listing.into_vec();
+            for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
+                    break;
+                }
+            }
+            reply.ok();
+            return;
+        }
+
+        // Handle SearchQuery directories (show resource type groups)
+        if self.search_query_directories.contains_key(&ino) {
+            // Refresh search results on every readdir
+            self.refresh_search_query(ino);
+
+            let mut listing = DirectoryListing::new();
+            listing.add_current_dir(ino);
+
+            if let Some(VFSEntry::SearchQuery(query)) = self.inode_index.get(ino) {
+                listing.add_parent_dir(query.parent_inode);
+            }
+
+            let children = self.inode_index.get_children(ino);
+            for &child_inode in &children {
+                if let Some(VFSEntry::SearchResultGroup(group)) = self.inode_index.get(child_inode) {
+                    listing.add_dir(group.inode, &group.resource_type);
+                }
+            }
+
+            let entries = listing.into_vec();
+            for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
+                    break;
+                }
+            }
+            reply.ok();
+            return;
+        }
+
+        // Handle SearchResultGroup directories (show resources in the group)
+        if self.search_result_groups.contains_key(&ino) {
+            // Don't refresh here - refresh only happens at SearchQuery level
+            // This prevents race conditions when tree/ls iterates multiple queries
+
+            let mut listing = DirectoryListing::new();
+            listing.add_current_dir(ino);
+
+            if let Some(VFSEntry::SearchResultGroup(group)) = self.inode_index.get(ino) {
+                listing.add_parent_dir(group.parent_inode);
+            }
+
+            let children = self.inode_index.get_children(ino);
+            let mut files: Vec<_> = children
+                .iter()
+                .filter_map(|&inode| {
+                    if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(inode) {
+                        Some((resource.filename.clone(), inode))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            files.sort_by_key(|(name, _)| name.clone());
+            for (name, inode) in files {
+                listing.add_file(inode, &name);
             }
 
             let entries = listing.into_vec();
@@ -761,7 +970,10 @@ impl Filesystem for FhirFuse {
 
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         match self.inode_index.get(ino) {
-            Some(VFSEntry::Directory(_)) | Some(VFSEntry::Search(_)) => {
+            Some(VFSEntry::Directory(_))
+            | Some(VFSEntry::Search(_))
+            | Some(VFSEntry::SearchQuery(_))
+            | Some(VFSEntry::SearchResultGroup(_)) => {
                 reply.opened(0, 0);
             }
             Some(_) => {
@@ -854,6 +1066,101 @@ impl Filesystem for FhirFuse {
             reply.error(ENOENT);
         }
     }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name_str = name.to_str().unwrap_or("");
+
+        // Check if parent is a _search directory
+        let search_info = if let Some(VFSEntry::Search(search)) = self.inode_index.get(parent) {
+            Some((search.resource_type.clone(), parent))
+        } else {
+            None
+        };
+
+        if let Some((resource_type, _search_inode)) = search_info {
+            let query = name_str.to_string();
+
+            println!("[Search] Creating search query: {}/{}?{}", resource_type, "_search", query);
+
+            // Execute FHIR search
+            let client = self.http_client.clone();
+            let base_url = self.fhir_base_url.clone();
+            let rt_clone = resource_type.clone();
+            let query_clone = query.clone();
+
+            let result = self.runtime.block_on(async {
+                search_fhir_resources(&client, &base_url, &rt_clone, &query_clone).await
+            });
+
+            match result {
+                Ok(grouped_resources) => {
+                    // Create SearchQuery directory
+                    let query_inode = self.inode_allocator.allocate();
+                    let search_query = SearchQuery::new(
+                        query_inode,
+                        query.clone(),
+                        resource_type.clone(),
+                        parent,
+                    );
+                    self.inode_index.insert_search_query(search_query);
+                    self.inode_index.add_parent_child_relation(parent, query_inode);
+                    self.search_query_directories.insert(query_inode, parent);
+                    self.search_query_info.insert(query_inode, (resource_type.clone(), query.clone()));
+
+                    // Create SearchResultGroup for each resource type in results
+                    for (res_type, resources) in grouped_resources {
+                        let group_inode = self.inode_allocator.allocate();
+                        let group = SearchResultGroup::new(
+                            group_inode,
+                            res_type.clone(),
+                            query_inode,
+                        );
+                        self.inode_index.insert_search_result_group(group);
+                        self.inode_index.add_parent_child_relation(query_inode, group_inode);
+                        self.search_result_groups.insert(group_inode, query_inode);
+
+                        println!("[Search] Created group {} with inode {}", res_type, group_inode);
+
+                        // Add each resource as a file in this group
+                        for resource in &resources {
+                            let res_inode = self.inode_allocator.allocate();
+                            let id = resource["id"].as_str().unwrap_or("unknown");
+                            let content = serde_json::to_string_pretty(&resource).unwrap_or_default();
+
+                            println!("[Search] Adding resource {}-{}.json to group {}", res_type, id, group_inode);
+
+                            let resource_entry = FHIRResource::new(res_inode, &res_type, id, content);
+                            self.inode_index.insert_resource(resource_entry);
+                            self.inode_index.add_parent_child_relation(group_inode, res_inode);
+                        }
+                        println!("[Search] Added {} resources to group {}", resources.len(), res_type);
+                    }
+
+                    if let Some(attr) = self.inode_index.get_attr(query_inode) {
+                        reply.entry(&TTL, &attr, 0);
+                    } else {
+                        reply.error(EIO);
+                    }
+                }
+                Err(e) => {
+                    println!("[Search] Failed: {}", e);
+                    reply.error(EIO);
+                }
+            }
+            return;
+        }
+
+        // mkdir not allowed elsewhere
+        reply.error(EACCES);
+    }
 }
 
 fn main() {
@@ -890,6 +1197,7 @@ fn main() {
         MountOption::FSName("fhir-fuse".to_string()),
         MountOption::CUSTOM("noappledouble".to_string()),
         MountOption::CUSTOM("noapplexattr".to_string()),
+        MountOption::AllowOther,  // Allow other users/apps to access
     ];
 
     match fuser::mount2(fs, mountpoint, &options) {

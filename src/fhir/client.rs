@@ -87,3 +87,59 @@ pub async fn delete_from_fhir_server(
         ))
     }
 }
+
+/// Search for resources using FHIR search API
+/// Returns resources grouped by resource type (important for _include/_revinclude)
+pub async fn search_fhir_resources(
+    client: &Client,
+    fhir_base_url: &str,
+    resource_type: &str,
+    query: &str,
+) -> anyhow::Result<std::collections::HashMap<String, Vec<serde_json::Value>>> {
+    use std::collections::HashMap;
+
+    let url = format!("{}/{}?{}", fhir_base_url, resource_type, query);
+    println!("[FHIR] Search: {}", url);
+
+    let response = client
+        .get(&url)
+        .header("Accept", "application/fhir+json")
+        .send()
+        .await?;
+
+    let status = response.status();
+    let response_text = response.text().await?;
+
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to search FHIR server: HTTP {} - {}",
+            status,
+            response_text
+        ));
+    }
+
+    let bundle: serde_json::Value = serde_json::from_str(&response_text)?;
+    let mut grouped_resources: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+    if let Some(entries) = bundle.get("entry").and_then(|e| e.as_array()) {
+        for entry in entries {
+            if let Some(resource) = entry.get("resource") {
+                let res_type = resource
+                    .get("resourceType")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+
+                grouped_resources
+                    .entry(res_type)
+                    .or_insert_with(Vec::new)
+                    .push(resource.clone());
+            }
+        }
+    }
+
+    let total: usize = grouped_resources.values().map(|v| v.len()).sum();
+    println!("[FHIR] Search returned {} resources across {} types", total, grouped_resources.len());
+
+    Ok(grouped_resources)
+}
