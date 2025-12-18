@@ -16,6 +16,7 @@ impl InodeAllocator {
         inode
     }
 
+    #[allow(dead_code)]
     pub fn allocate_range(&mut self, count: usize) -> Vec<u64> {
         let mut allocated = Vec::with_capacity(count);
         for _ in 0..count {
@@ -24,6 +25,7 @@ impl InodeAllocator {
         allocated
     }
 
+    #[allow(dead_code)]
     pub fn peek_next(&self) -> u64 {
         self.next_inode
     }

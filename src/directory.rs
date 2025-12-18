@@ -4,6 +4,7 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct Directory {
     pub inode: u64,
+    #[allow(dead_code)]
     pub name: String,
 }
 
@@ -88,10 +89,12 @@ impl DirectoryListing {
         self.entries.push(DirectoryEntry::new_file(inode, name));
     }
 
+    #[allow(dead_code)]
     pub fn add_entry(&mut self, entry: DirectoryEntry) {
         self.entries.push(entry);
     }
 
+    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = &DirectoryEntry> {
         self.entries.iter()
     }

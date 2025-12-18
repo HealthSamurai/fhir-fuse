@@ -3,8 +3,7 @@ use fuser::{
     Request,
 };
 use libc::ENOENT;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +13,9 @@ use text_file::TextFile;
 mod directory;
 use directory::{Directory, DirectoryListing};
 
+mod capability;
+use capability::{fetch_capability_statement, fetch_resources, ServerCapabilities};
+
 mod inode_allocator;
 use inode_allocator::InodeAllocator;
 
@@ -21,35 +23,27 @@ const TTL: Duration = Duration::from_secs(1);
 
 const README_CONTENT: &str = include_str!("../assets/README.md");
 
-#[derive(Debug, Deserialize, Serialize)]
-struct FhirBundle {
-    #[serde(rename = "resourceType")]
-    resource_type: String,
-    entry: Option<Vec<FhirBundleEntry>>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct FhirBundleEntry {
-    resource: serde_json::Value,
-}
-
 #[derive(Debug, Clone)]
-struct PatientFile {
-    inode: u64,
-    name: String,
+struct ResourceFile {
+    _inode: u64,
+    _name: String,
     content: String,
+    resource_type: String,
 }
 
 struct FhirFuse {
     fhir_base_url: String,
-    patients: HashMap<u64, PatientFile>,
-    name_to_inode: HashMap<String, u64>,
+    resources: HashMap<u64, ResourceFile>,
+    resource_name_to_inode: HashMap<String, HashMap<String, u64>>, // resource_type -> (filename -> inode)
     text_files: HashMap<u64, TextFile>,
     directories: HashMap<u64, Directory>,
+    resource_directories: HashMap<String, u64>, // resource_type -> directory_inode
+    loaded_resources: HashSet<String>,          // Track which resource types have been loaded
+    _capabilities: Option<ServerCapabilities>,
     inode_allocator: InodeAllocator,
     root_inode: u64,
-    patient_dir_inode: u64,
-    readme_inode: u64,
+    _patient_dir_inode: u64,
+    _readme_inode: u64,
 }
 
 impl FhirFuse {
@@ -71,70 +65,101 @@ impl FhirFuse {
             Directory::new(patient_dir_inode, "Patient"),
         );
 
-        let mut fs = FhirFuse {
+        let mut resource_directories = HashMap::new();
+        resource_directories.insert("Patient".to_string(), patient_dir_inode);
+
+        let mut capabilities = None;
+
+        // Fetch capabilities and create directories for each resource type
+        if fhir_base_url != "offline" {
+            match fetch_capability_statement(&fhir_base_url) {
+                Ok(caps) => {
+                    println!("Successfully fetched capabilities");
+                    for resource_type in &caps.resources {
+                        if resource_type != "Patient" {
+                            // Patient already created
+                            let dir_inode = inode_allocator.allocate();
+                            directories.insert(
+                                dir_inode,
+                                Directory::new(dir_inode, resource_type.clone()),
+                            );
+                            resource_directories.insert(resource_type.clone(), dir_inode);
+                        }
+                    }
+                    capabilities = Some(caps);
+                }
+                Err(e) => {
+                    eprintln!("Failed to fetch capabilities: {:#?}", e);
+                }
+            }
+        }
+
+        let fs = FhirFuse {
             fhir_base_url: fhir_base_url.clone(),
-            patients: HashMap::new(),
-            name_to_inode: HashMap::new(),
+            resources: HashMap::new(),
+            resource_name_to_inode: HashMap::new(),
             text_files,
             directories,
+            resource_directories,
+            loaded_resources: HashSet::new(),
+            _capabilities: capabilities,
             inode_allocator,
             root_inode,
-            patient_dir_inode,
-            readme_inode,
+            _patient_dir_inode: patient_dir_inode,
+            _readme_inode: readme_inode,
         };
-        if fhir_base_url != "offline" {
-            fs.refresh_patients();
-        }
+        // Don't load resources immediately - use lazy loading
         fs
     }
 
-    fn refresh_patients(&mut self) {
-        println!("Fetching patients from FHIR server...");
+    fn ensure_resources_loaded(&mut self, resource_type: &str) {
+        if self.fhir_base_url == "offline" {
+            return;
+        }
 
-        match self.fetch_patients() {
-            Ok(patients) => {
-                self.patients.clear();
-                self.name_to_inode.clear();
-
-                for patient in patients {
-                    let inode = self.inode_allocator.allocate();
-                    let id = patient["id"].as_str().unwrap_or("unknown");
-                    let filename = format!("{}.json", id);
-                    let content = serde_json::to_string_pretty(&patient).unwrap_or_default();
-
-                    let patient_file = PatientFile {
-                        inode,
-                        name: filename.clone(),
-                        content,
-                    };
-
-                    self.patients.insert(inode, patient_file);
-                    self.name_to_inode.insert(filename, inode);
-                }
-
-                println!("Loaded {} patients", self.patients.len());
-            }
-            Err(e) => {
-                eprintln!("Failed to fetch patients: {:#?}", e);
-            }
+        if !self.loaded_resources.contains(resource_type) {
+            self.refresh_resources(resource_type);
+            self.loaded_resources.insert(resource_type.to_string());
         }
     }
 
-    fn fetch_patients(&self) -> anyhow::Result<Vec<serde_json::Value>> {
-        let url = format!("{}/Patient", self.fhir_base_url);
-        println!("Url: {}", url);
-        println!("Base URL: {}", self.fhir_base_url);
-        let response = reqwest::blocking::get(&url)?;
-        let bundle: FhirBundle = response.json()?;
+    fn refresh_resources(&mut self, resource_type: &str) {
+        println!("Fetching {} resources from FHIR server...", resource_type);
 
-        let patients = bundle
-            .entry
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| entry.resource)
-            .collect();
+        match fetch_resources(&self.fhir_base_url, resource_type, Some(100)) {
+            Ok(resources) => {
+                // Clear old resources of this type
+                self.resources
+                    .retain(|_, r| r.resource_type != resource_type);
+                self.resource_name_to_inode.remove(resource_type);
 
-        Ok(patients)
+                let mut name_to_inode = HashMap::new();
+
+                for resource in resources {
+                    let inode = self.inode_allocator.allocate();
+                    let id = resource["id"].as_str().unwrap_or("unknown");
+                    let filename = format!("{}.json", id);
+                    let content = serde_json::to_string_pretty(&resource).unwrap_or_default();
+
+                    let resource_file = ResourceFile {
+                        _inode: inode,
+                        _name: filename.clone(),
+                        content,
+                        resource_type: resource_type.to_string(),
+                    };
+
+                    self.resources.insert(inode, resource_file);
+                    name_to_inode.insert(filename, inode);
+                }
+
+                println!("Loaded {} {} resources", name_to_inode.len(), resource_type);
+                self.resource_name_to_inode
+                    .insert(resource_type.to_string(), name_to_inode);
+            }
+            Err(e) => {
+                eprintln!("Failed to fetch {} resources: {:#?}", resource_type, e);
+            }
+        }
     }
 
     fn get_attrs(&self, inode: u64) -> Option<FileAttr> {
@@ -146,10 +171,10 @@ impl FhirFuse {
 
         match inode {
             _ => {
-                if let Some(patient) = self.patients.get(&inode) {
+                if let Some(resource) = self.resources.get(&inode) {
                     Some(FileAttr {
                         ino: inode,
-                        size: patient.content.len() as u64,
+                        size: resource.content.len() as u64,
                         blocks: 1,
                         atime: ts,
                         mtime: ts,
@@ -178,8 +203,9 @@ impl Filesystem for FhirFuse {
 
         match parent {
             parent if parent == self.root_inode => {
-                if name_str == "Patient" {
-                    if let Some(attr) = self.get_attrs(self.patient_dir_inode) {
+                // Check if it's a resource directory
+                if let Some(&dir_inode) = self.resource_directories.get(name_str) {
+                    if let Some(attr) = self.get_attrs(dir_inode) {
                         reply.entry(&TTL, &attr, 0);
                         return;
                     }
@@ -191,15 +217,27 @@ impl Filesystem for FhirFuse {
                     return;
                 }
             }
-            parent if parent == self.patient_dir_inode => {
-                if let Some(&inode) = self.name_to_inode.get(name_str) {
-                    if let Some(attr) = self.get_attrs(inode) {
-                        reply.entry(&TTL, &attr, 0);
-                        return;
+            parent => {
+                // Check if parent is a resource directory
+                let matching_resource = self
+                    .resource_directories
+                    .iter()
+                    .find(|(_, &dir_inode)| parent == dir_inode)
+                    .map(|(resource_type, _)| resource_type.clone());
+
+                if let Some(resource_type) = matching_resource {
+                    // Load resources on first access
+                    self.ensure_resources_loaded(&resource_type);
+                    if let Some(name_map) = self.resource_name_to_inode.get(&resource_type) {
+                        if let Some(&inode) = name_map.get(name_str) {
+                            if let Some(attr) = self.get_attrs(inode) {
+                                reply.entry(&TTL, &attr, 0);
+                                return;
+                            }
+                        }
                     }
                 }
             }
-            _ => {}
         }
 
         reply.error(ENOENT);
@@ -233,8 +271,8 @@ impl Filesystem for FhirFuse {
         if let Some(text_file) = self.text_files.get(&ino) {
             let data = text_file.read(offset, size);
             reply.data(&data);
-        } else if let Some(patient) = self.patients.get(&ino) {
-            let content = patient.content.as_bytes();
+        } else if let Some(resource) = self.resources.get(&ino) {
+            let content = resource.content.as_bytes();
             let offset = offset as usize;
             let size = size as usize;
 
@@ -262,7 +300,13 @@ impl Filesystem for FhirFuse {
                 let mut listing = DirectoryListing::new();
                 listing.add_current_dir(self.root_inode);
                 listing.add_parent_dir(self.root_inode);
-                listing.add_dir(self.patient_dir_inode, "Patient");
+
+                // Add resource directories
+                let mut resource_dirs: Vec<_> = self.resource_directories.iter().collect();
+                resource_dirs.sort_by_key(|(name, _)| name.as_str());
+                for (name, &inode) in resource_dirs {
+                    listing.add_dir(inode, name);
+                }
 
                 for text_file in self.text_files.values() {
                     listing.add_file(text_file.inode, &text_file.name);
@@ -276,25 +320,41 @@ impl Filesystem for FhirFuse {
                 }
                 reply.ok();
             }
-            ino if ino == self.patient_dir_inode => {
-                let mut listing = DirectoryListing::new();
-                listing.add_current_dir(self.patient_dir_inode);
-                listing.add_parent_dir(self.root_inode);
+            ino => {
+                // Check if this is a resource directory
+                let matching_resource = self
+                    .resource_directories
+                    .iter()
+                    .find(|(_, &dir_inode)| ino == dir_inode)
+                    .map(|(resource_type, &dir_inode)| (resource_type.clone(), dir_inode));
 
-                for patient in self.patients.values() {
-                    listing.add_file(patient.inode, &patient.name);
-                }
+                if let Some((resource_type, dir_inode)) = matching_resource {
+                    // Load resources on first access
+                    self.ensure_resources_loaded(&resource_type);
 
-                let entries = listing.into_vec();
-                for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
-                        break;
+                    let mut listing = DirectoryListing::new();
+                    listing.add_current_dir(dir_inode);
+                    listing.add_parent_dir(self.root_inode);
+
+                    // Add resource files for this type
+                    if let Some(name_map) = self.resource_name_to_inode.get(&resource_type) {
+                        let mut files: Vec<_> = name_map.iter().collect();
+                        files.sort_by_key(|(name, _)| name.as_str());
+                        for (name, &inode) in files {
+                            listing.add_file(inode, name);
+                        }
                     }
+
+                    let entries = listing.into_vec();
+                    for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                        if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
+                            break;
+                        }
+                    }
+                    reply.ok();
+                } else {
+                    reply.error(ENOENT);
                 }
-                reply.ok();
-            }
-            _ => {
-                reply.error(ENOENT);
             }
         }
     }
