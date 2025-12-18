@@ -25,21 +25,29 @@ docker-compose up -d
 
 ### ⚠️ macOS Users
 
-Due to Docker Desktop's VM architecture, FUSE mounts cannot propagate to the macOS host. Use the provided access script:
+Due to Docker Desktop's VM architecture, FUSE mounts cannot propagate to the macOS host directly.
+
+**Best Solution: Automated SSHFS Mount (Real-time Access)**
 
 ```sh
-# List patients
-./access-fuse.sh ls Patient
+# One-time setup (installs dependencies, configures everything)
+./setup-sshfs-macos.sh
 
-# View a patient file
-./access-fuse.sh cat Patient/<id>.json | jq .
-
-# Copy all files to host
-./access-fuse.sh sync
-ls ./mnt/Patient  # Now accessible on host!
+# Files now available in real-time at ~/mnt/fhir!
+ls ~/mnt/fhir/Patient
+cat ~/mnt/fhir/Patient/<id>.json | jq .
 ```
 
-See [MACOS_LIMITATIONS.md](MACOS_LIMITATIONS.md) for details and workarounds.
+See [SSHFS_SETUP.md](SSHFS_SETUP.md) for complete guide.
+
+**Alternative: Quick Access Script (Manual Sync)**
+
+```sh
+./access-fuse.sh ls Patient          # List files
+./access-fuse.sh sync                # Copy all to ./mnt
+```
+
+See [MACOS_LIMITATIONS.md](MACOS_LIMITATIONS.md) for all workarounds.
 
 The Docker setup includes:
 - **PostgreSQL**: Database for Aidbox

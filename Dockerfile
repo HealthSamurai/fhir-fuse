@@ -18,6 +18,7 @@ COPY target/${TARGETARCH}-unknown-linux-musl/release/fhir-fuse /usr/local/bin/fh
 # Make the binary executable
 RUN chmod +x /usr/local/bin/fhir-fuse
 
+RUN mkdir -p /mnt/fhir
 # Set working directory
 WORKDIR /mnt/fhir
 
