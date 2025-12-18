@@ -1,5 +1,6 @@
 use super::directory::Directory;
 use super::resource::FHIRResource;
+use super::search::Search;
 use super::text_file::TextFile;
 use std::collections::HashMap;
 
@@ -8,6 +9,7 @@ pub enum VFSEntry {
     Directory(Directory),
     TextFile(TextFile),
     FHIRResource(FHIRResource),
+    Search(Search),
 }
 
 #[derive(Debug)]
@@ -35,6 +37,11 @@ impl InodeIndex {
     pub fn insert_text_file(&mut self, text_file: TextFile) {
         let inode = text_file.inode;
         self.entries.insert(inode, VFSEntry::TextFile(text_file));
+    }
+
+    pub fn insert_search(&mut self, search: Search) {
+        let inode = search.inode;
+        self.entries.insert(inode, VFSEntry::Search(search));
     }
 
     pub fn insert_resource(&mut self, resource: FHIRResource) {
@@ -122,6 +129,7 @@ impl InodeIndex {
             VFSEntry::Directory(dir) => dir.get_attr(),
             VFSEntry::TextFile(file) => file.get_attr(),
             VFSEntry::FHIRResource(resource) => resource.get_attr(),
+            VFSEntry::Search(search) => search.get_attr(),
         })
     }
 
@@ -131,6 +139,7 @@ impl InodeIndex {
                 Some(VFSEntry::Directory(dir)) => dir.name == name,
                 Some(VFSEntry::TextFile(file)) => file.filename == name,
                 Some(VFSEntry::FHIRResource(resource)) => resource.filename == name,
+                Some(VFSEntry::Search(search)) => search.name == name,
                 None => false,
             }
         })
@@ -149,6 +158,7 @@ impl InodeIndex {
                 VFSEntry::Directory(_) => stats.directories += 1,
                 VFSEntry::TextFile(_) => stats.text_files += 1,
                 VFSEntry::FHIRResource(_) => stats.resources += 1,
+                VFSEntry::Search(_) => stats.search += 1,
             }
         }
         stats.total = self.entries.len();
@@ -163,14 +173,15 @@ pub struct IndexStats {
     pub directories: usize,
     pub text_files: usize,
     pub resources: usize,
+    pub search: usize,
 }
 
 impl std::fmt::Display for IndexStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Total: {}, Directories: {}, Text Files: {}, Resources: {}",
-            self.total, self.directories, self.text_files, self.resources
+            "Total: {}, Directories: {}, Text Files: {}, Resources: {}, Search: {}",
+            self.total, self.directories, self.text_files, self.resources, self.search
         )
     }
 }

@@ -8,7 +8,9 @@ use std::ffi::OsStr;
 use std::time::Duration;
 
 mod vfs;
-use vfs::{Directory, DirectoryListing, FHIRResource, IndexStats, InodeIndex, TextFile, VFSEntry};
+use vfs::{
+    Directory, DirectoryListing, FHIRResource, IndexStats, InodeIndex, Search, TextFile, VFSEntry,
+};
 
 mod fhir;
 use fhir::{fetch_capability_statement, fetch_resources};
@@ -20,13 +22,15 @@ const TTL: Duration = Duration::from_secs(1);
 const CACHE_DURATION: Duration = Duration::from_secs(5); // Force refresh after 5 seconds
 
 const README_CONTENT: &str = include_str!("../assets/README.md");
+const SEARCH_README_CONTENT: &str = include_str!("../assets/SEARCH_README.md");
 
 struct FhirFuse {
     fhir_base_url: String,
     inode_index: InodeIndex,
-    resource_directories: HashMap<String, u64>, // resource_type -> directory_inode
-    loaded_resources: HashSet<String>,          // Track which resource types have been loaded
-    resource_load_times: HashMap<String, std::time::Instant>, // Track when each resource type was loaded
+    resource_directories: HashMap<String, u64>, // resource_type -> directory inode
+    search_directories: HashMap<u64, u64>,      // search_dir_inode -> readme_inode
+    loaded_resources: HashSet<String>,          // track which resource types have been loaded
+    resource_load_times: HashMap<String, std::time::Instant>, // track when resources were loaded
     inode_allocator: InodeAllocator,
     pending_writes: HashMap<u64, Vec<u8>>, // Temporary storage for file writes
     created_files: HashMap<u64, (String, String)>, // inode -> (resource_type, filename)
@@ -52,6 +56,7 @@ impl FhirFuse {
         inode_index.add_parent_child_relation(root_inode, readme_inode);
 
         let mut resource_directories = HashMap::new();
+        let mut search_directories = HashMap::new();
 
         // Fetch capabilities and create directories for each resource type
         match fetch_capability_statement(&fhir_base_url) {
@@ -62,6 +67,25 @@ impl FhirFuse {
                     inode_index.insert_directory(Directory::new(dir_inode, resource_type.clone()));
                     inode_index.add_parent_child_relation(root_inode, dir_inode);
                     resource_directories.insert(resource_type.clone(), dir_inode);
+
+                    // Add _search directory for each resource type
+                    let search_inode = inode_allocator.allocate();
+                    inode_index.insert_search(Search::new(
+                        search_inode,
+                        resource_type.clone(),
+                        dir_inode,
+                    ));
+                    inode_index.add_parent_child_relation(dir_inode, search_inode);
+
+                    // Add README.md file inside _search directory
+                    let search_readme_inode = inode_allocator.allocate();
+                    inode_index.insert_text_file(TextFile::new(
+                        search_readme_inode,
+                        "README.md",
+                        SEARCH_README_CONTENT,
+                    ));
+                    inode_index.add_parent_child_relation(search_inode, search_readme_inode);
+                    search_directories.insert(search_inode, search_readme_inode);
                 }
             }
             Err(e) => {
@@ -73,6 +97,7 @@ impl FhirFuse {
             fhir_base_url: fhir_base_url.to_string(),
             inode_index,
             resource_directories,
+            search_directories,
             loaded_resources: HashSet::new(),
             resource_load_times: HashMap::new(),
             inode_allocator,
@@ -198,6 +223,17 @@ impl Filesystem for FhirFuse {
                         }
                     }
                 }
+
+                // Check if parent is a _search directory
+                if self.search_directories.contains_key(&parent) {
+                    if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
+                    {
+                        if let Some(attr) = self.get_attrs(child_inode) {
+                            reply.entry(&TTL, &attr, 0);
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -205,11 +241,10 @@ impl Filesystem for FhirFuse {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        println!("getattr: ino={}", ino);
         match self.inode_index.get(ino) {
             Some(VFSEntry::FHIRResource(resource)) => {
                 println!(
-                    "getattr: ino={} is FHIRResource '{}' (using cached metadata)",
+                    "[getattr]: ino={} is FHIRResource '{}' (using cached metadata)",
                     ino, resource.filename
                 );
                 // Use cached metadata for performance when listing directories.
@@ -227,9 +262,10 @@ impl Filesystem for FhirFuse {
                 let entry_type = match entry {
                     VFSEntry::Directory(d) => format!("Directory '{}'", d.name),
                     VFSEntry::TextFile(f) => format!("TextFile '{}'", f.filename),
+                    VFSEntry::Search(s) => format!("Search directory '{}'", s.name),
                     _ => "Unknown".to_string(),
                 };
-                println!("getattr: ino={} is {}", ino, entry_type);
+                println!("[getattr]: ino={} is {}", ino, entry_type);
                 if let Some(attr) = self.get_attrs(ino) {
                     reply.attr(&TTL, &attr);
                 } else {
@@ -352,6 +388,40 @@ impl Filesystem for FhirFuse {
             return;
         }
 
+        // Check if this is a _search directory first
+        if self.search_directories.contains_key(&ino) {
+            println!(
+                "[readdir #{}]: ino={} (_search directory), offset={}",
+                self.readdir_counter, ino, offset
+            );
+
+            let mut listing = DirectoryListing::new();
+            listing.add_current_dir(ino);
+
+            // Find parent directory (the resource type directory)
+            if let Some(VFSEntry::Search(search)) = self.inode_index.get(ino) {
+                listing.add_parent_dir(search.parent_inode);
+            }
+
+            // Add README.md file
+            let children = self.inode_index.get_children(ino);
+            for &child_inode in &children {
+                if let Some(VFSEntry::TextFile(file)) = self.inode_index.get(child_inode) {
+                    listing.add_file(file.inode, &file.filename);
+                }
+            }
+
+            let entries = listing.into_vec();
+            for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
+                    break;
+                }
+            }
+            reply.ok();
+            return;
+        }
+
+        // Then check if it's a resource directory
         if let Some((resource_type, dir_inode)) = self
             .resource_directories
             .iter()
@@ -371,6 +441,15 @@ impl Filesystem for FhirFuse {
 
             // Add all children of this directory
             let children = self.inode_index.get_children(dir_inode);
+
+            // Add _search directory
+            for &child_inode in &children {
+                if let Some(VFSEntry::Search(search)) = self.inode_index.get(child_inode) {
+                    listing.add_dir(search.inode, &search.name);
+                }
+            }
+
+            // Add resource files
             let mut files: Vec<_> = children
                 .iter()
                 .filter_map(|&inode| {
