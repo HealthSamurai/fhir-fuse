@@ -1,7 +1,8 @@
 use fuser::{
-    FileAttr, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    FileAttr, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyWrite, Request,
 };
-use libc::ENOENT;
+use libc::{EACCES, ENOENT};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::time::Duration;
@@ -25,6 +26,8 @@ struct FhirFuse {
     resource_directories: HashMap<String, u64>, // resource_type -> directory_inode
     loaded_resources: HashSet<String>,          // Track which resource types have been loaded
     inode_allocator: InodeAllocator,
+    pending_writes: HashMap<u64, Vec<u8>>, // Temporary storage for file writes
+    created_files: HashMap<u64, (String, String)>, // inode -> (resource_type, filename)
 }
 
 impl FhirFuse {
@@ -69,6 +72,8 @@ impl FhirFuse {
             resource_directories,
             loaded_resources: HashSet::new(),
             inode_allocator,
+            pending_writes: HashMap::new(),
+            created_files: HashMap::new(),
         };
         // Don't load resources immediately - use lazy loading
         fs
@@ -295,6 +300,229 @@ impl Filesystem for FhirFuse {
             }
         }
     }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let name_str = name.to_str().unwrap_or("");
+
+        // Check if this is a resource directory
+        let matching_resource = self
+            .resource_directories
+            .iter()
+            .find(|(_, &dir_inode)| parent == dir_inode)
+            .map(|(resource_type, _)| resource_type.clone());
+
+        if let Some(resource_type) = matching_resource {
+            println!("=== File Creation ===");
+            println!("Resource Type: {}", resource_type);
+            println!("Filename: {}", name_str);
+
+            if name_str.ends_with(".json") {
+                let resource_id = name_str.trim_end_matches(".json");
+                println!("Resource ID: {}", resource_id);
+                println!("Full path: /{}/{}", resource_type, name_str);
+            }
+
+            // Allocate a new inode for this file
+            let inode = self.inode_allocator.allocate();
+
+            // Initialize empty content for this inode
+            self.pending_writes.insert(inode, Vec::new());
+
+            // Track the resource type and filename for this created file
+            self.created_files
+                .insert(inode, (resource_type.clone(), name_str.to_string()));
+
+            // Create file attributes
+            let ts = std::time::SystemTime::now();
+            let attr = FileAttr {
+                ino: inode,
+                size: 0,
+                blocks: 0,
+                atime: ts,
+                mtime: ts,
+                ctime: ts,
+                crtime: ts,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 501,
+                gid: 20,
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            };
+
+            println!("Created file with inode: {}", inode);
+            println!("=============================");
+
+            // Return success with the file handle being the same as inode
+            reply.created(&TTL, &attr, 0, inode, 0);
+        } else {
+            println!("=== File Creation Failed ===");
+            println!("Can only create files in resource directories");
+            println!("Parent inode: {}", parent);
+            println!("Filename: {}", name_str);
+            println!("=============================");
+            reply.error(EACCES);
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        if let Some(content) = self.pending_writes.get_mut(&ino) {
+            let offset = offset as usize;
+
+            // Extend buffer if necessary
+            if offset + data.len() > content.len() {
+                content.resize(offset + data.len(), 0);
+            }
+
+            // Write data at the specified offset
+            content[offset..offset + data.len()].copy_from_slice(data);
+
+            println!("=== File Write ===");
+            println!("Inode: {}", ino);
+            println!("Offset: {}", offset);
+            println!("Size: {} bytes", data.len());
+
+            // Try to parse as JSON and print prettily
+            if let Ok(text) = std::str::from_utf8(content) {
+                println!("Content Preview:");
+                println!("{}", text);
+
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+                    println!("Valid JSON detected:");
+                    if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+                        println!("{}", pretty);
+                    }
+                }
+            }
+            println!("==================");
+
+            reply.written(data.len() as u32);
+        } else {
+            println!("Write attempt to unknown inode: {}", ino);
+            reply.error(ENOENT);
+        }
+    }
+
+    fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        println!("=== File Flush ===");
+        println!("Inode: {}", ino);
+
+        // Check if this is a created file that needs to be pushed to the server
+        if let Some((resource_type, filename)) = self.created_files.get(&ino) {
+            if let Some(content) = self.pending_writes.get(&ino) {
+                if let Ok(text) = std::str::from_utf8(content) {
+                    println!("Final content ({} bytes):", content.len());
+                    println!("{}", text);
+
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+                        println!("\nParsed as valid JSON:");
+                        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+                            println!("{}", pretty);
+                        }
+
+                        // Extract resource type and ID if present
+                        if let Some(resource_type) =
+                            json.get("resourceType").and_then(|v| v.as_str())
+                        {
+                            println!("\nResource Type: {}", resource_type);
+                        }
+                        if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                            println!("Resource ID: {}", id);
+                        }
+                    }
+
+                    // Send to FHIR server
+                    println!("\nPushing to FHIR server...");
+                    match vfs::resource::send_to_fhir_server(
+                        &self.fhir_base_url,
+                        resource_type,
+                        filename,
+                        text,
+                    ) {
+                        Ok(_response) => {
+                            println!("Successfully pushed to FHIR server");
+                        }
+                        Err(e) => {
+                            println!("Failed to push to FHIR server: {}", e);
+                        }
+                    }
+                }
+            }
+        } else if let Some(content) = self.pending_writes.get(&ino) {
+            // For existing files that were modified
+            if let Ok(text) = std::str::from_utf8(content) {
+                println!("Final content ({} bytes):", content.len());
+                println!("{}", text);
+
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+                    println!("\nParsed as valid JSON:");
+                    if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+                        println!("{}", pretty);
+                    }
+
+                    // Extract resource type and ID if present
+                    if let Some(resource_type) = json.get("resourceType").and_then(|v| v.as_str()) {
+                        println!("\nResource Type: {}", resource_type);
+                    }
+                    if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                        println!("Resource ID: {}", id);
+                    }
+                }
+            }
+        }
+
+        println!("==================");
+        reply.ok();
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        println!("=== File Release ===");
+        println!("Inode: {}", ino);
+
+        // Clean up pending writes for this inode
+        if self.pending_writes.remove(&ino).is_some() {
+            println!("Cleaned up pending writes for inode {}", ino);
+        }
+
+        // Clean up created files tracking
+        if self.created_files.remove(&ino).is_some() {
+            println!("Cleaned up created file tracking for inode {}", ino);
+        }
+
+        println!("====================");
+        reply.ok();
+    }
 }
 
 fn main() {
@@ -315,7 +543,7 @@ fn main() {
     let fs = FhirFuse::new(fhir_base_url.clone());
 
     let options = vec![
-        MountOption::RO,
+        MountOption::RW,
         MountOption::FSName("fhir-fuse".to_string()),
     ];
 

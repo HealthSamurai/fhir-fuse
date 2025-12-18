@@ -1,6 +1,55 @@
 use fuser::FileAttr;
 use std::time::SystemTime;
 
+/// Sends raw content to the FHIR server without validation
+pub fn send_to_fhir_server(
+    fhir_base_url: &str,
+    resource_type: &str,
+    filename: &str,
+    content: &str,
+) -> anyhow::Result<String> {
+    // Extract resource ID from filename (remove .json extension)
+    let resource_id = filename.trim_end_matches(".json");
+    let url = format!("{}/{}/{}", fhir_base_url, resource_type, resource_id);
+
+    println!("Sending resource to FHIR server:");
+    println!("  Method: PUT");
+    println!("  URL: {}", url);
+    println!("  Resource Type: {}", resource_type);
+    println!("  Resource ID: {}", resource_id);
+    println!("  Content size: {} bytes", content.len());
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .put(&url)
+        .header("Content-Type", "application/fhir+json")
+        .body(content.to_string())
+        .send()?;
+
+    let status = response.status();
+    let response_text = response.text()?;
+
+    println!("  Response status: {}", status);
+
+    if status.is_success() {
+        println!("  ✓ Successfully sent to FHIR server (PUT)");
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+            if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                println!("  Resource ID in response: {}", id);
+            }
+        }
+        Ok(response_text)
+    } else {
+        println!("  ✗ Failed to send to FHIR server");
+        println!("  Error response: {}", response_text);
+        Err(anyhow::anyhow!(
+            "Failed to PUT resource to FHIR server: HTTP {} - {}",
+            status,
+            response_text
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FHIRResource {
     pub inode: u64,
