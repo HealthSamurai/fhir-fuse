@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub fn get_from_fhir_server(
     fhir_base_url: &str,
     resource_type: &str,

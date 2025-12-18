@@ -10,6 +10,7 @@ pub struct FHIRResource {
     pub resource_id: String,
     pub filename: String,
     pub content: String,
+    pub mtime: SystemTime,
 }
 
 impl FHIRResource {
@@ -27,19 +28,19 @@ impl FHIRResource {
             resource_id,
             filename,
             content: content.into(),
+            mtime: SystemTime::now(),
         }
     }
 
     pub fn get_attr(&self) -> FileAttr {
-        let ts = SystemTime::now();
         FileAttr {
             ino: self.inode,
             size: self.content.len() as u64,
             blocks: 1,
-            atime: ts,
-            mtime: ts,
-            ctime: ts,
-            crtime: ts,
+            atime: self.mtime,
+            mtime: self.mtime,
+            ctime: self.mtime,
+            crtime: self.mtime,
             kind: fuser::FileType::RegularFile,
             perm: 0o644,
             nlink: 1,
@@ -48,6 +49,19 @@ impl FHIRResource {
             rdev: 0,
             flags: 0,
             blksize: 512,
+        }
+    }
+
+    pub fn read(&self, offset: i64, size: u32) -> Vec<u8> {
+        let content = self.content.as_bytes();
+        let offset = offset as usize;
+        let size = size as usize;
+
+        if offset < content.len() {
+            let end = std::cmp::min(offset + size, content.len());
+            content[offset..end].to_vec()
+        } else {
+            vec![]
         }
     }
 
