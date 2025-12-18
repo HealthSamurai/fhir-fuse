@@ -42,39 +42,41 @@ struct FhirFuse {
 impl FhirFuse {
     fn new(fhir_base_url: String) -> Self {
         let mut fs = FhirFuse {
-            fhir_base_url,
+            fhir_base_url: fhir_base_url.clone(),
             patients: HashMap::new(),
             name_to_inode: HashMap::new(),
         };
-        fs.refresh_patients();
+        if fhir_base_url == "offline" {
+            fs.refresh_patients();
+        }
         fs
     }
 
     fn refresh_patients(&mut self) {
         println!("Fetching patients from FHIR server...");
-        
+
         match self.fetch_patients() {
             Ok(patients) => {
                 println!("{:#?}", &patients);
                 self.patients.clear();
                 self.name_to_inode.clear();
-                
+
                 for (idx, patient) in patients.into_iter().enumerate() {
                     let inode = PATIENT_FILE_INODE_START + idx as u64;
                     let id = patient["id"].as_str().unwrap_or("unknown");
                     let filename = format!("{}.json", id);
                     let content = serde_json::to_string_pretty(&patient).unwrap_or_default();
-                    
+
                     let patient_file = PatientFile {
                         inode,
                         name: filename.clone(),
                         content,
                     };
-                    
+
                     self.patients.insert(inode, patient_file);
                     self.name_to_inode.insert(filename, inode);
                 }
-                
+
                 println!("Loaded {} patients", self.patients.len());
             }
             Err(e) => {
@@ -89,20 +91,20 @@ impl FhirFuse {
         println!("Base URL: {}", self.fhir_base_url);
         let response = reqwest::blocking::get(&url)?;
         let bundle: FhirBundle = response.json()?;
-        
+
         let patients = bundle
             .entry
             .unwrap_or_default()
             .into_iter()
             .map(|entry| entry.resource)
             .collect();
-        
+
         Ok(patients)
     }
 
     fn get_attrs(&self, inode: u64) -> Option<FileAttr> {
         let ts = SystemTime::now();
-        
+
         match inode {
             ROOT_INODE => Some(FileAttr {
                 ino: ROOT_INODE,
@@ -168,7 +170,7 @@ impl FhirFuse {
 impl Filesystem for FhirFuse {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_str().unwrap_or("");
-        
+
         match parent {
             ROOT_INODE => {
                 if name_str == "Patient" {
@@ -188,7 +190,7 @@ impl Filesystem for FhirFuse {
             }
             _ => {}
         }
-        
+
         reply.error(ENOENT);
     }
 
@@ -215,7 +217,7 @@ impl Filesystem for FhirFuse {
             let content = patient.content.as_bytes();
             let offset = offset as usize;
             let size = size as usize;
-            
+
             if offset < content.len() {
                 let end = std::cmp::min(offset + size, content.len());
                 reply.data(&content[offset..end]);
@@ -242,7 +244,7 @@ impl Filesystem for FhirFuse {
                     (ROOT_INODE, FileType::Directory, ".."),
                     (PATIENT_DIR_INODE, FileType::Directory, "Patient"),
                 ];
-                
+
                 for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
                     if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
                         break;
@@ -255,11 +257,11 @@ impl Filesystem for FhirFuse {
                     (PATIENT_DIR_INODE, FileType::Directory, ".".to_string()),
                     (ROOT_INODE, FileType::Directory, "..".to_string()),
                 ];
-                
+
                 for patient in self.patients.values() {
                     entries.push((patient.inode, FileType::RegularFile, patient.name.clone()));
                 }
-                
+
                 for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
                     if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
                         break;
@@ -276,26 +278,26 @@ impl Filesystem for FhirFuse {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    
+
     if args.len() != 3 {
         eprintln!("Usage: {} <mountpoint> <fhir_base_url>", args[0]);
         eprintln!("Example: {} /tmp/fhir http://localhost:8080/fhir", args[0]);
         std::process::exit(1);
     }
-    
+
     let mountpoint = &args[1];
     let fhir_base_url = &args[2];
-    
+
     println!("Mounting FHIR filesystem at: {}", mountpoint);
     println!("FHIR server: {}", fhir_base_url);
-    
+
     let fs = FhirFuse::new(fhir_base_url.clone());
-    
+
     let options = vec![
         MountOption::RO,
         MountOption::FSName("fhir-fuse".to_string()),
     ];
-    
+
     match fuser::mount2(fs, mountpoint, &options) {
         Ok(_) => println!("Filesystem unmounted"),
         Err(e) => eprintln!("Failed to mount filesystem: {}", e),
