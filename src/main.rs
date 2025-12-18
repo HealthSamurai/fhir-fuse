@@ -17,6 +17,7 @@ mod inode_allocator;
 use inode_allocator::InodeAllocator;
 
 const TTL: Duration = Duration::from_secs(1);
+const CACHE_DURATION: Duration = Duration::from_secs(5); // Force refresh after 5 seconds
 
 const README_CONTENT: &str = include_str!("../assets/README.md");
 
@@ -25,9 +26,12 @@ struct FhirFuse {
     inode_index: InodeIndex,
     resource_directories: HashMap<String, u64>, // resource_type -> directory_inode
     loaded_resources: HashSet<String>,          // Track which resource types have been loaded
+    resource_load_times: HashMap<String, std::time::Instant>, // Track when each resource type was loaded
     inode_allocator: InodeAllocator,
     pending_writes: HashMap<u64, Vec<u8>>, // Temporary storage for file writes
     created_files: HashMap<u64, (String, String)>, // inode -> (resource_type, filename)
+    lookup_counter: u64,                   // Track number of lookup calls
+    readdir_counter: u64,                  // Track number of readdir calls
 }
 
 impl FhirFuse {
@@ -66,22 +70,39 @@ impl FhirFuse {
         }
 
         let fs = FhirFuse {
-            fhir_base_url: fhir_base_url.clone(),
+            fhir_base_url: fhir_base_url.to_string(),
             inode_index,
             resource_directories,
             loaded_resources: HashSet::new(),
+            resource_load_times: HashMap::new(),
             inode_allocator,
             pending_writes: HashMap::new(),
             created_files: HashMap::new(),
+            lookup_counter: 0,
+            readdir_counter: 0,
         };
         // Don't load resources immediately - use lazy loading
         fs
     }
 
     fn ensure_resources_loaded(&mut self, resource_type: &str, force_refresh: bool) {
-        if force_refresh || !self.loaded_resources.contains(resource_type) {
+        let should_refresh = force_refresh
+            || !self.loaded_resources.contains(resource_type)
+            || self
+                .resource_load_times
+                .get(resource_type)
+                .map(|t| t.elapsed() > CACHE_DURATION)
+                .unwrap_or(true);
+
+        if should_refresh {
+            println!(
+                "Cache expired or force refresh for {}, fetching from server...",
+                resource_type
+            );
             self.refresh_resources(resource_type);
             self.loaded_resources.insert(resource_type.to_string());
+            self.resource_load_times
+                .insert(resource_type.to_string(), std::time::Instant::now());
         }
     }
 
@@ -142,7 +163,11 @@ impl FhirFuse {
 impl Filesystem for FhirFuse {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_str().unwrap_or("");
-        println!("{}:\tlookup", name_str);
+        self.lookup_counter += 1;
+        println!(
+            "[lookup #{}]: parent_ino={}, name='{}'",
+            self.lookup_counter, parent, name_str
+        );
 
         match parent {
             parent if parent == self.inode_allocator.root_inode => {
@@ -180,50 +205,31 @@ impl Filesystem for FhirFuse {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        println!("getattr: ino={}", ino);
         match self.inode_index.get(ino) {
             Some(VFSEntry::FHIRResource(resource)) => {
-                // Fetch fresh metadata from the server
-                let resource_id = resource.filename.trim_end_matches(".json");
-                match fhir::get_from_fhir_server(
-                    &self.fhir_base_url,
-                    &resource.resource_type,
-                    resource_id,
-                ) {
-                    Ok(content) => {
-                        // Create FileAttr with actual content size
-                        let ts = std::time::SystemTime::now();
-                        let attr = FileAttr {
-                            ino: resource.inode,
-                            size: content.len() as u64,
-                            blocks: 1,
-                            atime: ts,
-                            mtime: ts,
-                            ctime: ts,
-                            crtime: ts,
-                            kind: fuser::FileType::RegularFile,
-                            perm: 0o644,
-                            nlink: 1,
-                            uid: 501,
-                            gid: 20,
-                            rdev: 0,
-                            flags: 0,
-                            blksize: 512,
-                        };
-                        reply.attr(&TTL, &attr);
-                    }
-                    Err(e) => {
-                        println!("{}: getattr: failed to fetch from server: {}", ino, e);
-                        // Fall back to cached attributes
-                        if let Some(attr) = self.get_attrs(ino) {
-                            reply.attr(&TTL, &attr);
-                        } else {
-                            reply.error(EIO);
-                        }
-                    }
+                println!(
+                    "getattr: ino={} is FHIRResource '{}' (using cached metadata)",
+                    ino, resource.filename
+                );
+                // Use cached metadata for performance when listing directories.
+                // Fresh data is only fetched from the FHIR server when actually reading
+                // the file content (in the read() function). This avoids making hundreds
+                // of HTTP requests when simply listing a directory with many resources.
+                if let Some(attr) = self.get_attrs(ino) {
+                    reply.attr(&TTL, &attr);
+                } else {
+                    reply.error(ENOENT);
                 }
             }
-            Some(_) => {
+            Some(entry) => {
                 // For non-FHIR resources, use cached attributes
+                let entry_type = match entry {
+                    VFSEntry::Directory(d) => format!("Directory '{}'", d.name),
+                    VFSEntry::TextFile(f) => format!("TextFile '{}'", f.filename),
+                    _ => "Unknown".to_string(),
+                };
+                println!("getattr: ino={} is {}", ino, entry_type);
                 if let Some(attr) = self.get_attrs(ino) {
                     reply.attr(&TTL, &attr);
                 } else {
@@ -231,7 +237,7 @@ impl Filesystem for FhirFuse {
                 }
             }
             None => {
-                println!("{}: getattr: not found", ino);
+                println!("getattr: ino={} not found", ino);
                 reply.error(ENOENT);
             }
         }
@@ -312,8 +318,12 @@ impl Filesystem for FhirFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        self.readdir_counter += 1;
         if ino == self.inode_allocator.root_inode {
-            println!("{}: ROOT: readdir", ino);
+            println!(
+                "[readdir #{}]: ino={} (ROOT), offset={}",
+                self.readdir_counter, ino, offset
+            );
             let mut listing = DirectoryListing::new();
             listing.add_current_dir(self.inode_allocator.root_inode);
             listing.add_parent_dir(self.inode_allocator.root_inode);
@@ -348,9 +358,12 @@ impl Filesystem for FhirFuse {
             .find(|(_, &dir_inode)| ino == dir_inode)
             .map(|(resource_type, &dir_inode)| (resource_type.clone(), dir_inode))
         {
-            println!("{}: {}: readdir", ino, resource_type);
-            // Load resources on first access
-            self.ensure_resources_loaded(&resource_type, true);
+            println!(
+                "[readdir #{}]: ino={} (resource_type={}), offset={}",
+                self.readdir_counter, ino, resource_type, offset
+            );
+            // Load resources on first access (don't force refresh if already loaded)
+            self.ensure_resources_loaded(&resource_type, false);
 
             let mut listing = DirectoryListing::new();
             listing.add_current_dir(dir_inode);
@@ -374,7 +387,18 @@ impl Filesystem for FhirFuse {
             }
 
             let entries = listing.into_vec();
+            println!(
+                "[readdir #{}]: returning {} entries for {}, starting from offset {}",
+                self.readdir_counter,
+                entries.len(),
+                resource_type,
+                offset
+            );
             for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                println!(
+                    "  - entry: ino={}, type={:?}, name='{}'",
+                    entry.0, entry.1, entry.2
+                );
                 if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
                     break;
                 }
@@ -406,19 +430,10 @@ impl Filesystem for FhirFuse {
             .map(|(resource_type, _)| resource_type.clone());
 
         if let Some(resource_type) = matching_resource {
-            // Creating a new resource file
-
-            // Allocate a new inode for this file
             let inode = self.inode_allocator.allocate();
-
-            // Initialize empty content for this inode
             self.pending_writes.insert(inode, Vec::new());
-
-            // Track the resource type and filename for this created file
             self.created_files
                 .insert(inode, (resource_type.clone(), name_str.to_string()));
-
-            // Create a FHIR resource entry and add to index
             let resource_entry = FHIRResource::new(
                 inode,
                 &resource_type,
@@ -427,12 +442,10 @@ impl Filesystem for FhirFuse {
             );
             self.inode_index.insert_resource(resource_entry);
 
-            // Add parent-child relationship
             if let Some(&dir_inode) = self.resource_directories.get(&resource_type) {
                 self.inode_index.add_parent_child_relation(dir_inode, inode);
             }
 
-            // Create file attributes
             let ts = std::time::SystemTime::now();
             let attr = FileAttr {
                 ino: inode,
@@ -452,7 +465,7 @@ impl Filesystem for FhirFuse {
                 blksize: 512,
             };
 
-            println!("{}: [{}]: create: resource file", inode, name_str);
+            println!("[create]: {}/{}", resource_type, name_str);
 
             // Return success with the file handle being the same as inode
             reply.created(&TTL, &attr, 0, inode, 0);
@@ -507,6 +520,13 @@ impl Filesystem for FhirFuse {
                         match resource.put_to_fhir_server(&self.fhir_base_url) {
                             Ok(_response) => {
                                 println!("{}: [{}]: flush: pushed to FHIR", ino, filename);
+                                // Invalidate cache for this resource type after successful write
+                                self.loaded_resources.remove(&resource.resource_type);
+                                self.resource_load_times.remove(&resource.resource_type);
+                                println!(
+                                    "Invalidated cache for resource type: {}",
+                                    resource.resource_type
+                                );
                             }
                             Err(e) => {
                                 println!("{}: [{}]: flush: FHIR push failed: {}", ino, filename, e);
@@ -519,7 +539,37 @@ impl Filesystem for FhirFuse {
             }
         } else if let Some(content) = self.pending_writes.get(&ino) {
             // For existing files that were modified
-            if let Ok(text) = std::str::from_utf8(content) {
+            if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(ino) {
+                // Update the resource content and push to server
+                if let Ok(text) = std::str::from_utf8(content) {
+                    let updated_resource = FHIRResource::new(
+                        resource.inode,
+                        &resource.resource_type,
+                        &resource.resource_id,
+                        text,
+                    );
+
+                    match updated_resource.put_to_fhir_server(&self.fhir_base_url) {
+                        Ok(_response) => {
+                            println!("{}: [{}]: flush: updated in FHIR", ino, resource.filename);
+                            // Invalidate cache for this resource type after successful update
+                            self.loaded_resources.remove(&resource.resource_type);
+                            self.resource_load_times.remove(&resource.resource_type);
+                            println!(
+                                "Invalidated cache for resource type: {}",
+                                resource.resource_type
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "{}: [{}]: flush: FHIR update failed: {}",
+                                ino, resource.filename, e
+                            );
+                        }
+                    }
+                }
+            } else if let Ok(text) = std::str::from_utf8(content) {
+                // Non-FHIR resource, just log for debugging
                 println!("Final content ({} bytes):", content.len());
                 println!("{}", text);
 
@@ -539,8 +589,6 @@ impl Filesystem for FhirFuse {
                 }
             }
         }
-
-        println!("==================");
         reply.ok();
     }
 
@@ -669,14 +717,18 @@ impl Filesystem for FhirFuse {
             if server_delete_needed && name_str.ends_with(".json") {
                 // Try to get the FHIRResource from the index and use its method
                 if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(inode) {
+                    let resource_type = resource.resource_type.clone();
+                    println!("[unlink]: {}/{}", resource_type, name_str);
                     match resource.delete_from_fhir_server(&self.fhir_base_url) {
                         Ok(_) => {
-                            println!("{}: [{}]: unlink: deleted from FHIR", inode, name_str);
+                            self.loaded_resources.remove(&resource_type);
+                            self.resource_load_times.remove(&resource_type);
+                            println!("Invalidated cache for resource type: {}", resource_type);
                         }
                         Err(e) => {
                             println!(
-                                "{}: [{}]: unlink: FHIR delete failed: {}",
-                                inode, name_str, e
+                                "[unlink]: {}/{}: FHIR delete failed: {}",
+                                resource_type, name_str, e
                             );
                             reply.error(EIO);
                             return;
