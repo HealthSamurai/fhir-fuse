@@ -4,7 +4,6 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct Directory {
     pub inode: u64,
-    #[allow(dead_code)]
     pub name: String,
 }
 

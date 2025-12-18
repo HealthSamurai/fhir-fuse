@@ -99,10 +99,10 @@ pub fn fetch_capability_statement(fhir_base_url: &str) -> anyhow::Result<ServerC
 
     let capabilities = ServerCapabilities::from_capability_statement(capability_statement);
 
-    println!("Found {} resource types", capabilities.resources.len());
     println!(
-        "Searchable resources: {}",
-        capabilities.searchable_resources.len()
+        "Found {} resource types: {:?}",
+        capabilities.resources.len(),
+        capabilities.resources
     );
 
     Ok(capabilities)
