@@ -38,6 +38,10 @@ The container requires special privileges to mount FUSE filesystems:
 ### Volume Mounting
 The FUSE filesystem is mounted at `/mnt/fhir` inside the container and bind-mounted to `./mnt` on the host with `rshared` propagation to ensure the mount is visible on the host.
 
+**Key Point:** The `bind-propagation=rshared` setting is crucial - it makes the FUSE mount inside the container visible on the host machine. Without this, files would only be accessible inside the container.
+
+See [MOUNT_PROPAGATION.md](MOUNT_PROPAGATION.md) for detailed explanation.
+
 ## Usage
 
 ### Prerequisites
@@ -127,6 +131,29 @@ services:
 
 ## Troubleshooting
 
+### Transport Endpoint Not Connected
+
+**Error:** `invalid mount config for type "bind": stat ./mnt: transport endpoint is not connected`
+
+This is a stale FUSE mount from a previous run.
+
+**Solution:**
+
+```bash
+./cleanup-mount.sh
+./docker-run.sh -d
+```
+
+Or manually:
+```bash
+docker-compose down
+umount ./mnt 2>/dev/null || diskutil unmount force ./mnt 2>/dev/null
+rm -rf ./mnt && mkdir -p ./mnt
+docker-compose up -d
+```
+
+**Note:** The `docker-run.sh` script now automatically detects and fixes this issue!
+
 ### Container Fails to Start
 
 1. **Check if FUSE device exists:**
@@ -153,17 +180,39 @@ The container needs privileged mode to mount FUSE filesystems. Ensure:
 
 ### Mount Not Visible on Host
 
-Check the volume binding in docker-compose.yaml:
-```yaml
-volumes:
-  - type: bind
-    source: ./mnt
-    target: /mnt/fhir
-    bind:
-      propagation: rshared
-```
+**This is the most common issue!** The FUSE mount is inside the container but not visible on the host.
 
-Ensure the `./mnt` directory exists on the host.
+**Solutions:**
+
+1. **Check bind propagation is set:**
+   ```yaml
+   volumes:
+     - type: bind
+       source: ./mnt
+       target: /mnt/fhir
+       bind:
+         propagation: rshared  # This is critical!
+   ```
+
+2. **On Linux, make the mount point shared:**
+   ```bash
+   sudo mount --make-rshared ./mnt
+   docker-compose restart fhir-fuse
+   ```
+
+3. **Verify propagation:**
+   ```bash
+   docker inspect fhir-fuse-fhir-fuse-1 | grep -A5 Propagation
+   ```
+   Should show: `"Propagation": "rshared"`
+
+4. **Check files inside container first:**
+   ```bash
+   docker exec fhir-fuse-fhir-fuse-1 ls /mnt/fhir
+   ```
+   If files are there but not on host, it's a propagation issue.
+
+See [MOUNT_PROPAGATION.md](MOUNT_PROPAGATION.md) for complete troubleshooting guide.
 
 ### Architecture Mismatch
 

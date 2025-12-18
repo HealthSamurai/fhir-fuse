@@ -77,7 +77,7 @@ services:
       MOUNT_POINT: /mnt/fhir
     volumes:
       - type: bind
-        source: ./mnt
+        source: ${MOUNT_DIR:-./mnt}
         target: /mnt/fhir
         bind:
           propagation: rshared

@@ -42,7 +42,9 @@ To stop the services:
 docker-compose down
 ```
 
-**Note**: The fhir-fuse container requires privileged mode and access to `/dev/fuse` to mount the filesystem. The mounted filesystem will be available in the `./mnt` directory on your host machine.
+**Note**: The fhir-fuse container requires privileged mode and access to `/dev/fuse` to mount the filesystem. The mounted filesystem will be available in the `./mnt` directory on your host machine thanks to `rshared` bind propagation, which makes the FUSE mount inside the container visible on the host.
+
+For detailed information about how mount propagation works, see [MOUNT_PROPAGATION.md](MOUNT_PROPAGATION.md).
 
 ### Option 2: Using the mount script
 

@@ -57,7 +57,6 @@ impl FhirFuse {
 
         match self.fetch_patients() {
             Ok(patients) => {
-                println!("{:#?}", &patients);
                 self.patients.clear();
                 self.name_to_inode.clear();
 

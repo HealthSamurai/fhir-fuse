@@ -13,14 +13,33 @@ The easiest way to get started is using Docker Compose:
 
 ```sh
 # Set your architecture (x86_64 or aarch64)
-export TARGETARCH=x86_64
+export TARGETARCH=aarch64
 
 # Start all services (PostgreSQL, Aidbox, and FHIR-FUSE)
 docker-compose up -d
 
 # Access the mounted FHIR filesystem
-ls ./mnt/Patient
+# On Linux: ls ./mnt/Patient
+# On macOS: ./access-fuse.sh ls Patient  (see macOS note below)
 ```
+
+### ⚠️ macOS Users
+
+Due to Docker Desktop's VM architecture, FUSE mounts cannot propagate to the macOS host. Use the provided access script:
+
+```sh
+# List patients
+./access-fuse.sh ls Patient
+
+# View a patient file
+./access-fuse.sh cat Patient/<id>.json | jq .
+
+# Copy all files to host
+./access-fuse.sh sync
+ls ./mnt/Patient  # Now accessible on host!
+```
+
+See [MACOS_LIMITATIONS.md](MACOS_LIMITATIONS.md) for details and workarounds.
 
 The Docker setup includes:
 - **PostgreSQL**: Database for Aidbox
@@ -42,6 +61,17 @@ make build-all
 ```
 
 **Note:** Cross-compilation builds use Docker volume caching, so the first build takes ~8 minutes, but subsequent builds only take ~45 seconds! See [CACHING.md](CACHING.md) for details.
+
+### Troubleshooting
+
+If you encounter issues like "transport endpoint is not connected":
+
+```sh
+./cleanup-mount.sh
+./docker-run.sh -d
+```
+
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for complete troubleshooting guide.
 
 ## Dependencies
 
