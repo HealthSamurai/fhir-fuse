@@ -32,17 +32,12 @@ impl FhirFuse {
         let mut inode_allocator = InodeAllocator::new(1);
 
         let root_inode = inode_allocator.root_inode;
-        let patient_dir_inode = inode_allocator.allocate();
         let readme_inode = inode_allocator.allocate();
 
         let mut inode_index = InodeIndex::new();
 
         // Add root directory
         inode_index.insert_directory(Directory::new(root_inode, "/"));
-
-        // Add Patient directory
-        inode_index.insert_directory(Directory::new(patient_dir_inode, "Patient"));
-        inode_index.add_parent_child_relation(root_inode, patient_dir_inode);
 
         // Add README file
         let readme = TextFile::new(readme_inode, "README.md", README_CONTENT);
