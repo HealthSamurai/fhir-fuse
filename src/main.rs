@@ -3,9 +3,12 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyWrite, Request,
 };
 use libc::{EACCES, EIO, ENODATA, ENOENT};
+use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Runtime;
 
 mod vfs;
 use vfs::{
@@ -13,34 +16,36 @@ use vfs::{
 };
 
 mod fhir;
-use fhir::{fetch_capability_statement, fetch_resources};
+use fhir::{delete_from_fhir_server, fetch_capability_statement, fetch_resources_parallel, put_to_fhir_server};
 
 mod inode_allocator;
 use inode_allocator::InodeAllocator;
 
-const TTL: Duration = Duration::from_secs(30);  // Cache attributes for 30 seconds to reduce Finder polling
-const CACHE_DURATION: Duration = Duration::from_secs(5); // Force refresh after 5 seconds
+const TTL: Duration = Duration::from_secs(30);
+const CACHE_DURATION: Duration = Duration::from_secs(5);
 
 const README_CONTENT: &str = include_str!("../assets/README.md");
 const SEARCH_README_CONTENT: &str = include_str!("../assets/SEARCH_README.md");
 
 struct FhirFuse {
     fhir_base_url: String,
+    http_client: Client,
+    runtime: Arc<Runtime>,
     inode_index: InodeIndex,
-    resource_directories: HashMap<String, u64>, // resource_type -> directory inode
-    search_directories: HashMap<u64, u64>,      // search_dir_inode -> readme_inode
-    loaded_resources: HashSet<String>,          // track which resource types have been loaded
-    resource_load_times: HashMap<String, std::time::Instant>, // track when resources were loaded
+    resource_directories: HashMap<String, u64>,
+    search_directories: HashMap<u64, u64>,
+    loaded_resources: HashSet<String>,
+    resource_load_times: HashMap<String, std::time::Instant>,
     inode_allocator: InodeAllocator,
-    pending_writes: HashMap<u64, Vec<u8>>, // Temporary storage for file writes
-    created_files: HashMap<u64, (String, String)>, // inode -> (resource_type, filename)
-    temp_files: HashMap<u64, (u64, String, Vec<u8>)>, // inode -> (parent_inode, filename, content) for vim temp files
-    lookup_counter: u64,                   // Track number of lookup calls
-    readdir_counter: u64,                  // Track number of readdir calls
+    pending_writes: HashMap<u64, Vec<u8>>,
+    created_files: HashMap<u64, (String, String)>,
+    temp_files: HashMap<u64, (u64, String, Vec<u8>)>,
+    lookup_counter: u64,
+    readdir_counter: u64,
 }
 
 impl FhirFuse {
-    fn new(fhir_base_url: String) -> Self {
+    fn new(fhir_base_url: String, http_client: Client, runtime: Arc<Runtime>) -> Self {
         let mut inode_allocator = InodeAllocator::new(1);
 
         let root_inode = inode_allocator.root_inode;
@@ -65,10 +70,12 @@ impl FhirFuse {
         let mut resource_directories = HashMap::new();
         let mut search_directories = HashMap::new();
 
-        // Fetch capabilities and create directories for each resource type
-        match fetch_capability_statement(&fhir_base_url) {
+        // Fetch capabilities async and create directories for each resource type
+        let caps_result = runtime.block_on(fetch_capability_statement(&http_client, &fhir_base_url));
+
+        match caps_result {
             Ok(caps) => {
-                println!("Successfully fetched capabilities");
+                println!("Successfully fetched capabilities: {} resource types", caps.resources.len());
                 for resource_type in &caps.resources {
                     let dir_inode = inode_allocator.allocate();
                     inode_index.insert_directory(Directory::new(dir_inode, resource_type.clone()));
@@ -100,8 +107,10 @@ impl FhirFuse {
             }
         }
 
-        let fs = FhirFuse {
-            fhir_base_url: fhir_base_url.to_string(),
+        FhirFuse {
+            fhir_base_url,
+            http_client,
+            runtime,
             inode_index,
             resource_directories,
             search_directories,
@@ -113,9 +122,7 @@ impl FhirFuse {
             temp_files: HashMap::new(),
             lookup_counter: 0,
             readdir_counter: 0,
-        };
-        // Don't load resources immediately - use lazy loading
-        fs
+        }
     }
 
     fn ensure_resources_loaded(&mut self, resource_type: &str, force_refresh: bool) {
@@ -128,10 +135,6 @@ impl FhirFuse {
                 .unwrap_or(true);
 
         if should_refresh {
-            println!(
-                "Cache expired or force refresh for {}, fetching from server...",
-                resource_type
-            );
             self.refresh_resources(resource_type);
             self.loaded_resources.insert(resource_type.to_string());
             self.resource_load_times
@@ -140,8 +143,15 @@ impl FhirFuse {
     }
 
     fn refresh_resources(&mut self, resource_type: &str) {
-        println!("Fetching {} resources from FHIR server...", resource_type);
-        match fetch_resources(&self.fhir_base_url, resource_type, Some(100)) {
+        let client = self.http_client.clone();
+        let base_url = self.fhir_base_url.clone();
+        let rt = resource_type.to_string();
+
+        let result = self.runtime.block_on(async {
+            fetch_resources_parallel(&client, &base_url, &rt).await
+        });
+
+        match result {
             Ok(resources) => {
                 // Clear old resources of this type
                 self.inode_index.clear_resources_by_type(resource_type);
@@ -159,17 +169,16 @@ impl FhirFuse {
 
                     self.inode_index.insert_resource(resource_entry);
 
-                    // Add parent-child relation if we have the directory
                     if let Some(dir) = dir_inode {
                         self.inode_index.add_parent_child_relation(dir, inode);
                     }
                     count += 1;
                 }
 
-                println!("Loaded {} {} resources", count, resource_type);
+                println!("[FHIR] Loaded {} {} resources", count, resource_type);
             }
             Err(e) => {
-                println!("0: [{}]: refresh: failed: {}", resource_type, e);
+                println!("[FHIR] Failed to fetch {}: {}", resource_type, e);
             }
         }
     }
@@ -208,7 +217,6 @@ impl Filesystem for FhirFuse {
                 }
             }
             parent => {
-                // Check if parent is a resource directory
                 let matching_resource = self
                     .resource_directories
                     .iter()
@@ -216,7 +224,6 @@ impl Filesystem for FhirFuse {
                     .map(|(resource_type, _)| resource_type.clone());
 
                 if let Some(resource_type) = matching_resource {
-                    // Load resources on first access
                     self.ensure_resources_loaded(&resource_type, false);
 
                     if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
@@ -228,7 +235,6 @@ impl Filesystem for FhirFuse {
                     }
                 }
 
-                // Check if parent is a _search directory
                 if self.search_directories.contains_key(&parent) {
                     if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
                     {
@@ -239,7 +245,6 @@ impl Filesystem for FhirFuse {
                     }
                 }
 
-                // Check for temp files (vim swap files, etc.)
                 for (&inode, (temp_parent, filename, content)) in &self.temp_files {
                     if *temp_parent == parent && filename == name_str {
                         let ts = std::time::SystemTime::now();
@@ -280,7 +285,6 @@ impl Filesystem for FhirFuse {
                 }
             }
             None => {
-                // Check temp files
                 if let Some((_, _, content)) = self.temp_files.get(&ino) {
                     let ts = std::time::SystemTime::now();
                     let attr = FileAttr {
@@ -329,7 +333,6 @@ impl Filesystem for FhirFuse {
                 reply.data(&data);
             }
             _ => {
-                // Check temp files
                 if let Some((_, _filename, content)) = self.temp_files.get(&ino) {
                     let offset = offset as usize;
                     let size = size as usize;
@@ -361,7 +364,6 @@ impl Filesystem for FhirFuse {
             listing.add_current_dir(self.inode_allocator.root_inode);
             listing.add_parent_dir(self.inode_allocator.root_inode);
 
-            // Add all children of root
             let children = self
                 .inode_index
                 .get_children(self.inode_allocator.root_inode);
@@ -385,17 +387,14 @@ impl Filesystem for FhirFuse {
             return;
         }
 
-        // Check if this is a _search directory first
         if self.search_directories.contains_key(&ino) {
             let mut listing = DirectoryListing::new();
             listing.add_current_dir(ino);
 
-            // Find parent directory (the resource type directory)
             if let Some(VFSEntry::Search(search)) = self.inode_index.get(ino) {
                 listing.add_parent_dir(search.parent_inode);
             }
 
-            // Add README.md file
             let children = self.inode_index.get_children(ino);
             for &child_inode in &children {
                 if let Some(VFSEntry::TextFile(file)) = self.inode_index.get(child_inode) {
@@ -413,31 +412,26 @@ impl Filesystem for FhirFuse {
             return;
         }
 
-        // Then check if it's a resource directory
         if let Some((resource_type, dir_inode)) = self
             .resource_directories
             .iter()
             .find(|(_, &dir_inode)| ino == dir_inode)
             .map(|(resource_type, &dir_inode)| (resource_type.clone(), dir_inode))
         {
-            // Load resources on first access (don't force refresh if already loaded)
             self.ensure_resources_loaded(&resource_type, false);
 
             let mut listing = DirectoryListing::new();
             listing.add_current_dir(dir_inode);
             listing.add_parent_dir(self.inode_allocator.root_inode);
 
-            // Add all children of this directory
             let children = self.inode_index.get_children(dir_inode);
 
-            // Add _search directory
             for &child_inode in &children {
                 if let Some(VFSEntry::Search(search)) = self.inode_index.get(child_inode) {
                     listing.add_dir(search.inode, &search.name);
                 }
             }
 
-            // Add resource files
             let mut files: Vec<_> = children
                 .iter()
                 .filter_map(|&inode| {
@@ -478,25 +472,22 @@ impl Filesystem for FhirFuse {
     ) {
         let name_str = name.to_str().unwrap_or("");
 
-        // Check if this is a resource directory
         let matching_resource = self
             .resource_directories
             .iter()
             .find(|(_, &dir_inode)| parent == dir_inode)
             .map(|(resource_type, _)| resource_type.clone());
 
-        // Helper to check if this is a vim temp file
         let is_temp_file = |name: &str| -> bool {
             name.starts_with('.') && name.ends_with(".swp")
                 || name.starts_with('.') && name.ends_with(".swo")
                 || name.starts_with('.') && name.contains(".sw")
-                || name == "4913"  // vim's test file
-                || name.starts_with(".")  // other hidden files
-                || name.ends_with("~")  // vim backup files
+                || name == "4913"
+                || name.starts_with(".")
+                || name.ends_with("~")
         };
 
         if let Some(resource_type) = matching_resource {
-            // Check if this is a temp file (vim swap, test file, etc.)
             if is_temp_file(name_str) {
                 let inode = self.inode_allocator.allocate();
                 self.temp_files.insert(inode, (parent, name_str.to_string(), Vec::new()));
@@ -520,7 +511,6 @@ impl Filesystem for FhirFuse {
                     blksize: 512,
                 };
 
-                println!("[create]: temp file {}", name_str);
                 reply.created(&TTL, &attr, 0, inode, 0);
                 return;
             }
@@ -533,7 +523,7 @@ impl Filesystem for FhirFuse {
                 inode,
                 &resource_type,
                 name_str.trim_end_matches(".json"),
-                String::new(), // Empty content initially
+                String::new(),
             );
             self.inode_index.insert_resource(resource_entry);
 
@@ -561,15 +551,8 @@ impl Filesystem for FhirFuse {
             };
 
             println!("[create]: {}/{}", resource_type, name_str);
-
-            // Return success with the file handle being the same as inode
             reply.created(&TTL, &attr, 0, inode, 0);
         } else {
-            println!("=== File Creation Failed ===");
-            println!("Can only create files in resource directories");
-            println!("Parent inode: {}", parent);
-            println!("Filename: {}", name_str);
-            println!("=============================");
             reply.error(EACCES);
         }
     }
@@ -586,7 +569,6 @@ impl Filesystem for FhirFuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        // Check if this is a temp file
         if let Some((_parent, _filename, content)) = self.temp_files.get_mut(&ino) {
             let offset = offset as usize;
             if offset + data.len() > content.len() {
@@ -597,14 +579,10 @@ impl Filesystem for FhirFuse {
             return;
         }
 
-        // Initialize pending_writes for this inode if it doesn't exist
-        // This handles both newly created files and existing files being edited
         if !self.pending_writes.contains_key(&ino) {
-            // For existing FHIR resources, load their current content
             if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(ino) {
                 self.pending_writes.insert(ino, resource.content.as_bytes().to_vec());
             } else {
-                // For new files, start with empty buffer
                 self.pending_writes.insert(ino, Vec::new());
             }
         }
@@ -612,12 +590,10 @@ impl Filesystem for FhirFuse {
         if let Some(content) = self.pending_writes.get_mut(&ino) {
             let offset = offset as usize;
 
-            // Extend buffer if necessary
             if offset + data.len() > content.len() {
                 content.resize(offset + data.len(), 0);
             }
 
-            // Write data at the specified offset
             content[offset..offset + data.len()].copy_from_slice(data);
 
             reply.written(data.len() as u32);
@@ -627,41 +603,40 @@ impl Filesystem for FhirFuse {
     }
 
     fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        // Skip temp files - they don't need to be synced to FHIR
         if self.temp_files.contains_key(&ino) {
             reply.ok();
             return;
         }
 
-        // Check if we have pending writes for this inode
         if let Some(content) = self.pending_writes.get(&ino) {
             if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(ino) {
-                // Update the resource content and push to server
                 if let Ok(text) = std::str::from_utf8(content) {
-                    let updated_resource = FHIRResource::new(
-                        resource.inode,
-                        &resource.resource_type,
-                        &resource.resource_id,
-                        text,
-                    );
-
                     let is_new_file = self.created_files.contains_key(&ino);
                     let action = if is_new_file { "created" } else { "updated" };
 
-                    match updated_resource.put_to_fhir_server(&self.fhir_base_url) {
+                    let client = self.http_client.clone();
+                    let base_url = self.fhir_base_url.clone();
+                    let resource_type = resource.resource_type.clone();
+                    let filename = resource.filename.clone();
+                    let resource_id = resource.resource_id.clone();
+                    let content_str = text.to_string();
+
+                    let result = self.runtime.block_on(async {
+                        put_to_fhir_server(&client, &base_url, &resource_type, &filename, &content_str).await
+                    });
+
+                    match result {
                         Ok(_response) => {
-                            println!("[FHIR] {}: {} {}", resource.resource_type, resource.resource_id, action);
-                            // Invalidate cache for this resource type after successful write
-                            self.loaded_resources.remove(&resource.resource_type);
-                            self.resource_load_times.remove(&resource.resource_type);
+                            println!("[FHIR] {}: {} {}", resource_type, resource_id, action);
+                            self.loaded_resources.remove(&resource_type);
+                            self.resource_load_times.remove(&resource_type);
                         }
                         Err(e) => {
-                            println!("[FHIR] {}: {} {} failed: {}", resource.resource_type, resource.resource_id, action, e);
+                            println!("[FHIR] {}: {} {} failed: {}", resource_type, resource_id, action, e);
                         }
                     }
                 }
             }
-            // Non-FHIR resources are silently ignored
         }
         reply.ok();
     }
@@ -676,18 +651,12 @@ impl Filesystem for FhirFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        // Clean up pending writes if they exist
         self.pending_writes.remove(&ino);
-
-        // Clean up created files tracking
         self.created_files.remove(&ino);
-
         reply.ok();
     }
 
     fn listxattr(&mut self, _req: &Request, _ino: u64, _size: u32, reply: fuser::ReplyXattr) {
-        // Return empty list of extended attributes
-        // This tells macOS there are no xattrs, so cp won't try to copy them
         reply.size(0);
     }
 
@@ -699,7 +668,6 @@ impl Filesystem for FhirFuse {
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        // Extended attribute not found
         reply.error(ENODATA);
     }
 
@@ -713,8 +681,6 @@ impl Filesystem for FhirFuse {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        // Silently ignore attempts to set extended attributes
-        // This allows cp to succeed even if it tries to copy xattrs
         reply.ok();
     }
 
@@ -736,20 +702,9 @@ impl Filesystem for FhirFuse {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        println!("=== Set Attributes ===");
-        println!("Inode: {}", ino);
-        if let Some(m) = mode {
-            println!("Mode: {:o}", m);
-        }
-        if let Some(s) = size {
-            println!("Size: {}", s);
-        }
-
-        // Check temp files first
         if let Some((_, _, content)) = self.temp_files.get_mut(&ino) {
             if let Some(new_size) = size {
                 content.resize(new_size as usize, 0);
-                println!("{}: setattr temp: truncate to {}", ino, new_size);
             }
             let ts = std::time::SystemTime::now();
             let attr = FileAttr {
@@ -773,33 +728,26 @@ impl Filesystem for FhirFuse {
             return;
         }
 
-        // Get current attributes
         if let Some(mut attr) = self.get_attrs(ino) {
-            // Update size if requested (for truncate operations)
             if let Some(new_size) = size {
                 attr.size = new_size;
 
-                // If this is a pending write, truncate the buffer
                 if let Some(content) = self.pending_writes.get_mut(&ino) {
                     content.resize(new_size as usize, 0);
-                    println!("{}: setattr: truncate to {}", ino, new_size);
                 }
             }
 
-            // Update mode if requested
             if let Some(new_mode) = mode {
                 attr.perm = new_mode as u16;
             }
 
             reply.attr(&TTL, &attr);
         } else {
-            println!("{}: setattr: not found", ino);
             reply.error(ENOENT);
         }
     }
 
     fn access(&mut self, _req: &Request, ino: u64, _mask: i32, reply: ReplyEmpty) {
-        // Check if inode exists (including temp files)
         if self.inode_index.get(ino).is_some() || self.temp_files.contains_key(&ino) {
             reply.ok();
         } else {
@@ -808,20 +756,10 @@ impl Filesystem for FhirFuse {
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: fuser::ReplyStatfs) {
-        reply.statfs(
-            0,    // blocks
-            0,    // bfree
-            0,    // bavail
-            0,    // files
-            0,    // ffree
-            512,  // bsize
-            255,  // namelen
-            0,    // frsize
-        );
+        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        // Check if inode exists and is a directory
         match self.inode_index.get(ino) {
             Some(VFSEntry::Directory(_)) | Some(VFSEntry::Search(_)) => {
                 reply.opened(0, 0);
@@ -836,21 +774,16 @@ impl Filesystem for FhirFuse {
     }
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        // Check temp files first
         if self.temp_files.contains_key(&ino) {
             reply.opened(0, 0);
             return;
         }
 
-        // Check if inode exists and is a readable file
         match self.inode_index.get(ino) {
             Some(VFSEntry::TextFile(_)) | Some(VFSEntry::FHIRResource(_)) => {
-                // Use direct I/O flag to prevent kernel caching issues
-                // Return 0 as the file handle - we identify files by inode
                 reply.opened(0, 0);
             }
             Some(_) => {
-                // Directory or other non-file type
                 reply.error(libc::EISDIR);
             }
             None => {
@@ -862,7 +795,6 @@ impl Filesystem for FhirFuse {
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = name.to_str().unwrap_or("");
 
-        // Check if this is a temp file first
         let temp_inode = self.temp_files.iter()
             .find(|(_, (p, n, _))| *p == parent && n == name_str)
             .map(|(&ino, _)| ino);
@@ -873,7 +805,6 @@ impl Filesystem for FhirFuse {
             return;
         }
 
-        // Check if this is a resource directory and might need server deletion
         let mut server_delete_needed = false;
 
         for (_res_type, &dir_inode) in &self.resource_directories {
@@ -883,49 +814,43 @@ impl Filesystem for FhirFuse {
             }
         }
 
-        // Find the inode of the file to delete (if it exists in our index)
         let file_inode = self.inode_index.find_child_by_name(parent, name_str);
 
         if let Some(inode) = file_inode {
-            // Delete from FHIR server if it's a resource file
             if server_delete_needed && name_str.ends_with(".json") {
-                // Try to get the FHIRResource from the index and use its method
                 if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(inode) {
                     let resource_type = resource.resource_type.clone();
-                    println!("[unlink]: {}/{}", resource_type, name_str);
-                    match resource.delete_from_fhir_server(&self.fhir_base_url) {
+                    let filename = resource.filename.clone();
+                    let resource_id = resource.resource_id.clone();
+
+                    let client = self.http_client.clone();
+                    let base_url = self.fhir_base_url.clone();
+
+                    let result = self.runtime.block_on(async {
+                        delete_from_fhir_server(&client, &base_url, &resource_type, &filename).await
+                    });
+
+                    match result {
                         Ok(_) => {
+                            println!("[FHIR] {}: {} deleted", resource_type, resource_id);
                             self.loaded_resources.remove(&resource_type);
                             self.resource_load_times.remove(&resource_type);
-                            println!("Invalidated cache for resource type: {}", resource_type);
                         }
                         Err(e) => {
-                            println!(
-                                "[unlink]: {}/{}: FHIR delete failed: {}",
-                                resource_type, name_str, e
-                            );
+                            println!("[FHIR] {}: {} delete failed: {}", resource_type, resource_id, e);
                             reply.error(EIO);
                             return;
                         }
                     }
-                } else {
-                    println!("{}: [{}]: unlink: not a FHIR resource", inode, name_str);
                 }
             }
 
-            // Remove from pending writes if present
             self.pending_writes.remove(&inode);
-
-            // Remove from created_files if present
             self.created_files.remove(&inode);
-
-            // Remove from the index
             self.inode_index.remove(inode);
 
-            println!("{}: [{}]: unlink: deleted", inode, name_str);
             reply.ok();
         } else {
-            println!("0: [{}]: unlink: not found in parent {}", name_str, parent);
             reply.error(ENOENT);
         }
     }
@@ -946,13 +871,25 @@ fn main() {
     println!("Mounting FHIR filesystem at: {}", mountpoint);
     println!("FHIR server: {}", fhir_base_url);
 
-    let fs = FhirFuse::new(fhir_base_url.clone());
+    // Create tokio runtime
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime")
+    );
+
+    // Create HTTP client
+    let http_client = Client::new();
+
+    let fs = FhirFuse::new(fhir_base_url.clone(), http_client, runtime);
 
     let options = vec![
         MountOption::RW,
         MountOption::FSName("fhir-fuse".to_string()),
-        MountOption::CUSTOM("noappledouble".to_string()), // Disable ._* files
-        MountOption::CUSTOM("noapplexattr".to_string()),  // Disable Apple extended attributes
+        MountOption::CUSTOM("noappledouble".to_string()),
+        MountOption::CUSTOM("noapplexattr".to_string()),
     ];
 
     match fuser::mount2(fs, mountpoint, &options) {
