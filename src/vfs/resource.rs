@@ -48,6 +48,42 @@ pub fn put_to_fhir_server(
     }
 }
 
+pub fn delete_from_fhir_server(
+    fhir_base_url: &str,
+    resource_type: &str,
+    filename: &str,
+) -> anyhow::Result<()> {
+    let resource_id = filename.trim_end_matches(".json");
+    let url = format!("{}/{}/{}", fhir_base_url, resource_type, resource_id);
+
+    println!("Deleting resource from FHIR server:");
+    println!("  Method: DELETE");
+    println!("  URL: {}", url);
+    println!("  Resource Type: {}", resource_type);
+    println!("  Resource ID: {}", resource_id);
+
+    let client = reqwest::blocking::Client::new();
+    let response = client.delete(&url).send()?;
+
+    let status = response.status();
+    let response_text = response.text()?;
+
+    println!("  Response status: {}", status);
+
+    if status.is_success() || status.as_u16() == 404 {
+        println!("  ✓ Successfully deleted from FHIR server");
+        Ok(())
+    } else {
+        println!("  ✗ Failed to delete from FHIR server");
+        println!("  Error response: {}", response_text);
+        Err(anyhow::anyhow!(
+            "Failed to DELETE resource from FHIR server: HTTP {} - {}",
+            status,
+            response_text
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FHIRResource {
     pub inode: u64,

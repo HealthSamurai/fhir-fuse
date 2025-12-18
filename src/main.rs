@@ -2,7 +2,7 @@ use fuser::{
     FileAttr, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyWrite, Request,
 };
-use libc::{EACCES, ENOENT};
+use libc::{EACCES, EIO, ENOENT};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::time::Duration;
@@ -547,7 +547,7 @@ impl Filesystem for FhirFuse {
             // Update size if requested (for truncate operations)
             if let Some(new_size) = size {
                 attr.size = new_size;
-                
+
                 // If this is a pending write, truncate the buffer
                 if let Some(content) = self.pending_writes.get_mut(&ino) {
                     content.resize(new_size as usize, 0);
@@ -565,6 +565,72 @@ impl Filesystem for FhirFuse {
             reply.attr(&TTL, &attr);
         } else {
             println!("Inode {} not found", ino);
+            println!("======================");
+            reply.error(ENOENT);
+        }
+    }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        println!("=== File Unlink (Delete) ===");
+        let name_str = name.to_str().unwrap_or("");
+        println!("Parent inode: {}, Name: {}", parent, name_str);
+
+        // Find the inode of the file to delete
+        if let Some(file_inode) = self.inode_index.find_child_by_name(parent, name_str) {
+            println!("Found file inode: {}", file_inode);
+
+            // Determine if this is a resource file that needs server deletion
+            let mut server_delete_needed = false;
+            let mut resource_type = String::new();
+
+            // Check if the parent is a resource directory
+            for (res_type, &dir_inode) in &self.resource_directories {
+                if dir_inode == parent {
+                    resource_type = res_type.clone();
+                    server_delete_needed = true;
+                    break;
+                }
+            }
+
+            // Delete from FHIR server if it's a resource file
+            if server_delete_needed && name_str.ends_with(".json") {
+                println!("Deleting resource from FHIR server...");
+                match vfs::resource::delete_from_fhir_server(
+                    &self.fhir_base_url,
+                    &resource_type,
+                    name_str,
+                ) {
+                    Ok(_) => {
+                        println!("✓ Deleted from FHIR server");
+                    }
+                    Err(e) => {
+                        println!("✗ Failed to delete from FHIR server: {}", e);
+                        println!("======================");
+                        reply.error(EIO);
+                        return;
+                    }
+                }
+            }
+
+            // Remove from pending writes if present
+            if self.pending_writes.remove(&file_inode).is_some() {
+                println!("Removed from pending_writes");
+            }
+
+            // Remove from created files if present
+            if self.created_files.remove(&file_inode).is_some() {
+                println!("Removed from created_files");
+            }
+
+            // Remove from inode index (this handles all the internal cleanup)
+            self.inode_index.remove(file_inode);
+            println!("Removed from inode index");
+
+            println!("✓ File deleted successfully");
+            println!("======================");
+            reply.ok();
+        } else {
+            println!("File not found");
             println!("======================");
             reply.error(ENOENT);
         }
