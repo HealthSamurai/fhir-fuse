@@ -523,6 +523,61 @@ impl Filesystem for FhirFuse {
         println!("====================");
         reply.ok();
     }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        println!("=== Set Attributes ===");
+        println!("Inode: {}", ino);
+        if let Some(m) = mode {
+            println!("Mode: {:o}", m);
+        }
+        if let Some(s) = size {
+            println!("Size: {}", s);
+        }
+
+        // Get current attributes
+        if let Some(mut attr) = self.get_attrs(ino) {
+            // Update size if requested (for truncate operations)
+            if let Some(new_size) = size {
+                attr.size = new_size;
+                
+                // If this is a pending write, truncate the buffer
+                if let Some(content) = self.pending_writes.get_mut(&ino) {
+                    content.resize(new_size as usize, 0);
+                    println!("Truncated pending write buffer to {} bytes", new_size);
+                }
+            }
+
+            // Update mode if requested
+            if let Some(new_mode) = mode {
+                attr.perm = new_mode as u16;
+            }
+
+            println!("Updated attributes for inode {}", ino);
+            println!("======================");
+            reply.attr(&TTL, &attr);
+        } else {
+            println!("Inode {} not found", ino);
+            println!("======================");
+            reply.error(ENOENT);
+        }
+    }
 }
 
 fn main() {
