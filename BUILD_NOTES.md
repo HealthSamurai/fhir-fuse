@@ -33,6 +33,19 @@ apk add --no-cache fuse-dev fuse-static pkgconfig
 
 This provides the static version of libfuse (`libfuse.a`) required for static linking with musl.
 
+## Build Caching
+
+All cross-compilation builds now use Docker volume caching to dramatically speed up rebuilds:
+
+- **First build**: ~8 minutes (downloads and compiles everything)
+- **Subsequent builds**: ~45 seconds (only recompiles changed code)
+
+The Makefile automatically creates and uses persistent Docker volumes for:
+- Cargo registry cache (`cargo-cache-*`)
+- Cargo git cache (`cargo-git-cache-*`)
+
+See [CACHING.md](CACHING.md) for full details on cache management.
+
 ## Build Results
 
 ### ARM64 (aarch64) Alpine Binary

@@ -73,7 +73,7 @@ services:
     security_opt:
       - apparmor:unconfined
     environment:
-      FHIR_SERVER_URL: http://aidbox:8080
+      FHIR_SERVER_URL: http://aidbox:8080/fhir
       MOUNT_POINT: /mnt/fhir
     volumes:
       - type: bind
@@ -81,4 +81,4 @@ services:
         target: /mnt/fhir
         bind:
           propagation: rshared
-    command: ["/usr/local/bin/fhir-fuse", "http://aidbox:8080", "/mnt/fhir"]
+    command: ["/usr/local/bin/fhir-fuse", "/mnt/fhir", "http://aidbox:8080/fhir"]

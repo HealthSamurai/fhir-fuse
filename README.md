@@ -29,6 +29,20 @@ The Docker setup includes:
 
 For more details, see [USAGE.md](USAGE.md).
 
+## Building from Source
+
+### Quick Build
+
+```sh
+# Build for your current platform
+cargo build --release
+
+# Cross-compile for all platforms (uses Docker with caching)
+make build-all
+```
+
+**Note:** Cross-compilation builds use Docker volume caching, so the first build takes ~8 minutes, but subsequent builds only take ~45 seconds! See [CACHING.md](CACHING.md) for details.
+
 ## Dependencies
 
 FUSE must be installed to build or run programs that use FUSE-Rust (i.e. kernel driver and libraries. Some platforms may also require userland utils like `fusermount`). A default installation of FUSE is usually sufficient.

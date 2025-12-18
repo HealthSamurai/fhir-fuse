@@ -55,6 +55,7 @@ impl FhirFuse {
         
         match self.fetch_patients() {
             Ok(patients) => {
+                println!("{:#?}", &patients);
                 self.patients.clear();
                 self.name_to_inode.clear();
                 
@@ -77,13 +78,15 @@ impl FhirFuse {
                 println!("Loaded {} patients", self.patients.len());
             }
             Err(e) => {
-                eprintln!("Failed to fetch patients: {}", e);
+                eprintln!("Failed to fetch patients: {:#?}", e);
             }
         }
     }
 
     fn fetch_patients(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         let url = format!("{}/Patient", self.fhir_base_url);
+        println!("Url: {}", url);
+        println!("Base URL: {}", self.fhir_base_url);
         let response = reqwest::blocking::get(&url)?;
         let bundle: FhirBundle = response.json()?;
         
