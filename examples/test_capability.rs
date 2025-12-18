@@ -1,7 +1,7 @@
 use std::env;
 
 // Add the parent directory modules to the path
-#[path = "../src/capability.rs"]
+#[path = "../src/fhir/capability.rs"]
 mod capability;
 
 use capability::{fetch_capability_statement, fetch_resources};

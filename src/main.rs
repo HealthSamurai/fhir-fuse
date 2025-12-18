@@ -10,8 +10,8 @@ use std::time::Duration;
 mod vfs;
 use vfs::{Directory, DirectoryListing, FHIRResource, IndexStats, InodeIndex, TextFile, VFSEntry};
 
-mod capability;
-use capability::{fetch_capability_statement, fetch_resources};
+mod fhir;
+use fhir::{fetch_capability_statement, fetch_resources};
 
 mod inode_allocator;
 use inode_allocator::InodeAllocator;
@@ -460,7 +460,7 @@ impl Filesystem for FhirFuse {
 
                     // Send to FHIR server
                     println!("\nPushing to FHIR server...");
-                    match vfs::resource::put_to_fhir_server(
+                    match fhir::put_to_fhir_server(
                         &self.fhir_base_url,
                         resource_type,
                         filename,
@@ -642,11 +642,7 @@ impl Filesystem for FhirFuse {
             // Delete from FHIR server if it's a resource file
             if server_delete_needed && name_str.ends_with(".json") {
                 println!("Deleting resource from FHIR server...");
-                match vfs::resource::delete_from_fhir_server(
-                    &self.fhir_base_url,
-                    &resource_type,
-                    name_str,
-                ) {
+                match fhir::delete_from_fhir_server(&self.fhir_base_url, &resource_type, name_str) {
                     Ok(_) => {
                         println!("✓ Deleted from FHIR server");
                     }
