@@ -2,7 +2,7 @@ use fuser::{
     FileAttr, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyWrite, Request,
 };
-use libc::{EACCES, EIO, ENOENT};
+use libc::{EACCES, EIO, ENODATA, ENOENT};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::time::Duration;
@@ -332,6 +332,20 @@ impl Filesystem for FhirFuse {
             self.created_files
                 .insert(inode, (resource_type.clone(), name_str.to_string()));
 
+            // Create a FHIR resource entry and add to index
+            let resource_entry = FHIRResource::new(
+                inode,
+                &resource_type,
+                name_str.trim_end_matches(".json"),
+                String::new(), // Empty content initially
+            );
+            self.inode_index.insert_resource(resource_entry);
+
+            // Add parent-child relationship
+            if let Some(&dir_inode) = self.resource_directories.get(&resource_type) {
+                self.inode_index.add_parent_child_relation(dir_inode, inode);
+            }
+
             // Create file attributes
             let ts = std::time::SystemTime::now();
             let attr = FileAttr {
@@ -512,6 +526,39 @@ impl Filesystem for FhirFuse {
         }
 
         println!("====================");
+        reply.ok();
+    }
+
+    fn listxattr(&mut self, _req: &Request, _ino: u64, _size: u32, reply: fuser::ReplyXattr) {
+        // Return empty list of extended attributes
+        // This tells macOS there are no xattrs, so cp won't try to copy them
+        reply.size(0);
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        // Extended attribute not found
+        reply.error(ENODATA);
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        // Silently ignore attempts to set extended attributes
+        // This allows cp to succeed even if it tries to copy xattrs
         reply.ok();
     }
 
