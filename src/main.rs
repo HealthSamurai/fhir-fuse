@@ -79,12 +79,8 @@ impl FhirFuse {
         fs
     }
 
-    fn ensure_resources_loaded(&mut self, resource_type: &str) {
-        if self.fhir_base_url == "offline" {
-            return;
-        }
-
-        if !self.loaded_resources.contains(resource_type) {
+    fn ensure_resources_loaded(&mut self, resource_type: &str, force: bool) {
+        if !self.loaded_resources.contains(resource_type) || force {
             self.refresh_resources(resource_type);
             self.loaded_resources.insert(resource_type.to_string());
         }
@@ -168,7 +164,7 @@ impl Filesystem for FhirFuse {
 
                 if let Some(resource_type) = matching_resource {
                     // Load resources on first access
-                    self.ensure_resources_loaded(&resource_type);
+                    self.ensure_resources_loaded(&resource_type, true);
 
                     if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
                     {
@@ -224,81 +220,76 @@ impl Filesystem for FhirFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        match ino {
-            ino if ino == self.inode_allocator.root_inode => {
-                let mut listing = DirectoryListing::new();
-                listing.add_current_dir(self.inode_allocator.root_inode);
-                listing.add_parent_dir(self.inode_allocator.root_inode);
+        if ino == self.inode_allocator.root_inode {
+            let mut listing = DirectoryListing::new();
+            listing.add_current_dir(self.inode_allocator.root_inode);
+            listing.add_parent_dir(self.inode_allocator.root_inode);
 
-                // Add all children of root
-                let children = self
-                    .inode_index
-                    .get_children(self.inode_allocator.root_inode);
-                for child_inode in children {
-                    if let Some(entry) = self.inode_index.get(child_inode) {
-                        match entry {
-                            VFSEntry::Directory(dir) => listing.add_dir(dir.inode, &dir.name),
-                            VFSEntry::TextFile(file) => listing.add_file(file.inode, &file.name),
-                            _ => {}
-                        }
+            // Add all children of root
+            let children = self
+                .inode_index
+                .get_children(self.inode_allocator.root_inode);
+            for child_inode in children {
+                if let Some(entry) = self.inode_index.get(child_inode) {
+                    match entry {
+                        VFSEntry::Directory(dir) => listing.add_dir(dir.inode, &dir.name),
+                        VFSEntry::TextFile(file) => listing.add_file(file.inode, &file.name),
+                        _ => {}
                     }
-                }
-
-                let entries = listing.into_vec();
-                for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
-                        break;
-                    }
-                }
-                reply.ok();
-            }
-            ino => {
-                // Check if this is a resource directory
-                let matching_resource = self
-                    .resource_directories
-                    .iter()
-                    .find(|(_, &dir_inode)| ino == dir_inode)
-                    .map(|(resource_type, &dir_inode)| (resource_type.clone(), dir_inode));
-
-                if let Some((resource_type, dir_inode)) = matching_resource {
-                    // Load resources on first access
-                    self.ensure_resources_loaded(&resource_type);
-
-                    let mut listing = DirectoryListing::new();
-                    listing.add_current_dir(dir_inode);
-                    listing.add_parent_dir(self.inode_allocator.root_inode);
-
-                    // Add all children of this directory
-                    let children = self.inode_index.get_children(dir_inode);
-                    let mut files: Vec<_> = children
-                        .iter()
-                        .filter_map(|&inode| {
-                            if let Some(VFSEntry::FHIRResource(resource)) =
-                                self.inode_index.get(inode)
-                            {
-                                Some((resource.filename.clone(), inode))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    files.sort_by_key(|(name, _)| name.clone());
-                    for (name, inode) in files {
-                        listing.add_file(inode, &name);
-                    }
-
-                    let entries = listing.into_vec();
-                    for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                        if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
-                            break;
-                        }
-                    }
-                    reply.ok();
-                } else {
-                    reply.error(ENOENT);
                 }
             }
+
+            let entries = listing.into_vec();
+            for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
+                    break;
+                }
+            }
+            reply.ok();
+            return;
         }
+
+        if let Some((resource_type, dir_inode)) = self
+            .resource_directories
+            .iter()
+            .find(|(_, &dir_inode)| ino == dir_inode)
+            .map(|(resource_type, &dir_inode)| (resource_type.clone(), dir_inode))
+        {
+            // Load resources on first access
+            self.ensure_resources_loaded(&resource_type, true);
+
+            let mut listing = DirectoryListing::new();
+            listing.add_current_dir(dir_inode);
+            listing.add_parent_dir(self.inode_allocator.root_inode);
+
+            // Add all children of this directory
+            let children = self.inode_index.get_children(dir_inode);
+            let mut files: Vec<_> = children
+                .iter()
+                .filter_map(|&inode| {
+                    if let Some(VFSEntry::FHIRResource(resource)) = self.inode_index.get(inode) {
+                        Some((resource.filename.clone(), inode))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            files.sort_by_key(|(name, _)| name.clone());
+            for (name, inode) in files {
+                listing.add_file(inode, &name);
+            }
+
+            let entries = listing.into_vec();
+            for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) {
+                    break;
+                }
+            }
+            reply.ok();
+            return;
+        }
+
+        reply.error(ENOENT);
     }
 
     fn create(
@@ -455,7 +446,7 @@ impl Filesystem for FhirFuse {
 
                     // Send to FHIR server
                     println!("\nPushing to FHIR server...");
-                    match vfs::resource::send_to_fhir_server(
+                    match vfs::resource::put_to_fhir_server(
                         &self.fhir_base_url,
                         resource_type,
                         filename,

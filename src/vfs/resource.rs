@@ -1,14 +1,12 @@
 use fuser::FileAttr;
 use std::time::SystemTime;
 
-/// Sends raw content to the FHIR server without validation
-pub fn send_to_fhir_server(
+pub fn put_to_fhir_server(
     fhir_base_url: &str,
     resource_type: &str,
     filename: &str,
     content: &str,
 ) -> anyhow::Result<String> {
-    // Extract resource ID from filename (remove .json extension)
     let resource_id = filename.trim_end_matches(".json");
     let url = format!("{}/{}/{}", fhir_base_url, resource_type, resource_id);
 
