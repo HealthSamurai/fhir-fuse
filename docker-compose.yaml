@@ -55,3 +55,30 @@ services:
       timeout: 5s
       retries: 90
       start_period: 30s
+  fhir-fuse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # TARGETARCH: ${TARGETARCH:-x86_64}
+        TARGETARCH: ${TARGETARCH:-aarch64}
+    depends_on:
+      aidbox:
+        condition: service_healthy
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      FHIR_SERVER_URL: http://aidbox:8080
+      MOUNT_POINT: /mnt/fhir
+    volumes:
+      - type: bind
+        source: ./mnt
+        target: /mnt/fhir
+        bind:
+          propagation: rshared
+    command: ["/usr/local/bin/fhir-fuse", "http://aidbox:8080", "/mnt/fhir"]

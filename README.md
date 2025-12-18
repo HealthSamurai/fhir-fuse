@@ -7,6 +7,28 @@
 Звучит как сказка? Она реальней чем вы себе представляете.
 Благодаря технологии Filesystem in Userspace (FUSE) можно создать и замонтировать виртуальную файловую систему которая будет отображать данные вашего, самого лучшего, FHIR сервера.
 
+## Quick Start with Docker
+
+The easiest way to get started is using Docker Compose:
+
+```sh
+# Set your architecture (x86_64 or aarch64)
+export TARGETARCH=x86_64
+
+# Start all services (PostgreSQL, Aidbox, and FHIR-FUSE)
+docker-compose up -d
+
+# Access the mounted FHIR filesystem
+ls ./mnt/Patient
+```
+
+The Docker setup includes:
+- **PostgreSQL**: Database for Aidbox
+- **Aidbox**: FHIR server
+- **FHIR-FUSE**: Alpine-based container with FUSE filesystem mounted at `./mnt`
+
+For more details, see [USAGE.md](USAGE.md).
+
 ## Dependencies
 
 FUSE must be installed to build or run programs that use FUSE-Rust (i.e. kernel driver and libraries. Some platforms may also require userland utils like `fusermount`). A default installation of FUSE is usually sufficient.

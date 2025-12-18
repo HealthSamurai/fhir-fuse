@@ -21,7 +21,30 @@ cargo build --release
 
 ## Running
 
-### Option 1: Using the mount script
+### Option 1: Using Docker Compose (Recommended)
+
+The easiest way to run FHIR FUSE is with Docker Compose, which includes Aidbox FHIR server and PostgreSQL:
+
+```bash
+# Set the target architecture (x86_64 or aarch64)
+export TARGETARCH=x86_64  # or aarch64 for ARM64
+
+# Start all services
+docker-compose up -d
+
+# The FHIR filesystem will be mounted at ./mnt directory
+ls ./mnt/Patient
+```
+
+To stop the services:
+
+```bash
+docker-compose down
+```
+
+**Note**: The fhir-fuse container requires privileged mode and access to `/dev/fuse` to mount the filesystem. The mounted filesystem will be available in the `./mnt` directory on your host machine.
+
+### Option 2: Using the mount script
 
 ```bash
 ./mount.sh

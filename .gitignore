@@ -22,3 +22,6 @@ Cargo.lock
 # Debug
 debug/
 
+# Mount points
+/mnt/
+

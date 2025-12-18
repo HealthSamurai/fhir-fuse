@@ -99,7 +99,7 @@ build-linux-musl-x64:
 		-v "$(PWD)":/workspace \
 		-w /workspace \
 		rust:alpine \
-		sh -c "apk add --no-cache fuse-dev pkgconfig && cargo build --release && cp target/release/fhir-fuse target/x86_64-unknown-linux-musl/release/"
+		sh -c "apk add --no-cache fuse-dev fuse-static pkgconfig && cargo build --release && cp target/release/fhir-fuse target/x86_64-unknown-linux-musl/release/"
 	@echo "Binary: target/x86_64-unknown-linux-musl/release/fhir-fuse"
 
 build-linux-musl-arm64:
@@ -109,7 +109,7 @@ build-linux-musl-arm64:
 		-v "$(PWD)":/workspace \
 		-w /workspace \
 		rust:alpine \
-		sh -c "apk add --no-cache fuse-dev pkgconfig && cargo build --release && cp target/release/fhir-fuse target/aarch64-unknown-linux-musl/release/"
+		sh -c "apk add --no-cache fuse-dev fuse-static pkgconfig && cargo build --release && cp target/release/fhir-fuse target/aarch64-unknown-linux-musl/release/"
 	@echo "Binary: target/aarch64-unknown-linux-musl/release/fhir-fuse"
 
 # Aliases for Alpine Linux
