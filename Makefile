@@ -1,4 +1,4 @@
-.PHONY: help build run release clean test check fmt lint install-targets build-all clean-cache list-cache cache-stats
+.PHONY: help build run release clean test check fmt lint install-targets build-all clean-cache list-cache cache-stats docker-build-arm64 docker-push-arm64
 
 # Default target
 help:
@@ -26,6 +26,10 @@ help:
 	@echo "  make build-alpine-x64      - Alias for build-linux-musl-x64"
 	@echo "  make build-alpine-arm64    - Alias for build-linux-musl-arm64"
 	@echo "  make build-windows-x64     - Windows (not supported - FUSE unavailable)"
+	@echo ""
+	@echo "Docker image management:"
+	@echo "  make docker-build-arm64    - Build Docker image for ARM64 Linux"
+	@echo "  make docker-push-arm64     - Push Docker image for ARM64 Linux to registry"
 	@echo ""
 	@echo "Cache management:"
 	@echo "  make list-cache            - List all Docker volume caches"
@@ -200,3 +204,19 @@ clean-cache:
 	else \
 		echo "Cancelled"; \
 	fi
+
+# Docker image management
+docker-build-arm64: build-linux-musl-arm64
+	@echo "Building Docker image for ARM64 Linux..."
+	docker build \
+		-t ryukzak/fhir-fuse:arm64 \
+		-t ryukzak/fhir-fuse:latest-arm64 \
+		-f Dockerfile \
+		.
+	@echo "✅ Docker image built: ryukzak/fhir-fuse:arm64"
+
+docker-push-arm64: docker-build-arm64
+	@echo "Pushing Docker image for ARM64 Linux to registry..."
+	docker push ryukzak/fhir-fuse:arm64
+	docker push ryukzak/fhir-fuse:latest-arm64
+	@echo "✅ Docker image pushed: ryukzak/fhir-fuse:arm64"

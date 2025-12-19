@@ -11,9 +11,8 @@ RUN apk add --no-cache \
 RUN mkdir -p /mnt/fhir
 
 # Copy the pre-built binary for Alpine (musl)
-# The architecture will be determined by the build context
-ARG TARGETARCH
-COPY target/${TARGETARCH}-unknown-linux-musl/release/fhir-fuse /usr/local/bin/fhir-fuse
+# For ARM64, the Rust target directory is aarch64, not arm64
+COPY target/aarch64-unknown-linux-musl/release/fhir-fuse /usr/local/bin/fhir-fuse
 
 # Make the binary executable
 RUN chmod +x /usr/local/bin/fhir-fuse
@@ -24,4 +23,3 @@ WORKDIR /mnt/fhir
 
 # Default command
 CMD ["/usr/local/bin/fhir-fuse"]
-
