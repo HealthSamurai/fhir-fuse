@@ -87,7 +87,7 @@ impl ResourceVersion {
         let resource_type = resource_type.into();
         let resource_id = resource_id.into();
         let version_id = version_id.into();
-        let filename = format!("{}.v{}.json", resource_id, version_id);
+        let filename = format!("{}.json", version_id);
 
         Self {
             inode,
