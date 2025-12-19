@@ -1578,14 +1578,14 @@ impl Filesystem for FhirFuse {
         let total_blocks = total_size / block_size as u64;
         let free_blocks = free_size / block_size as u64;
         reply.statfs(
-            total_blocks,  // total blocks
-            free_blocks,   // free blocks
-            free_blocks,   // available blocks (same as free for our purposes)
-            1_000_000,     // total inodes
-            999_000,       // free inodes
-            block_size,    // block size
-            255,           // max name length
-            block_size,    // fragment size
+            total_blocks, // total blocks
+            free_blocks,  // free blocks
+            free_blocks,  // available blocks (same as free for our purposes)
+            1_000_000,    // total inodes
+            999_000,      // free inodes
+            block_size,   // block size
+            255,          // max name length
+            block_size,   // fragment size
         );
     }
 
@@ -1816,7 +1816,8 @@ impl Filesystem for FhirFuse {
                                         content_str.to_string(),
                                     );
                                     self.inode_index.insert_resource(resource_entry);
-                                    self.inode_index.add_parent_child_relation(newparent, new_inode);
+                                    self.inode_index
+                                        .add_parent_child_relation(newparent, new_inode);
                                     // Don't invalidate cache - keep the new inode valid
                                     reply.ok();
                                     return;
@@ -1843,21 +1844,50 @@ impl Filesystem for FhirFuse {
         }
 
         // Handle renaming regular files (not temp files)
-        // For FHIR resources, we don't support renaming - files are synced with the server
-        if self.inode_index.find_child_by_name(parent, name_str).is_some() {
+        if let Some(inode) = self.inode_index.find_child_by_name(parent, name_str) {
             // Check if source is in a resource directory
-            let source_is_resource = self
-                .resource_directories
-                .values()
-                .any(|&dir| dir == parent);
+            let source_is_resource = self.resource_directories.values().any(|&dir| dir == parent);
 
             if source_is_resource {
-                // Renaming FHIR resources is not supported
-                println!(
-                    "[rename]: Renaming FHIR resources not supported: {} -> {}",
-                    name_str, newname_str
-                );
-                reply.error(EACCES);
+                // Check if renaming within the same directory
+                if parent != newparent {
+                    // Renaming across directories is not supported
+                    println!(
+                        "[rename]: Renaming across directories not supported: {} -> {}",
+                        name_str, newname_str
+                    );
+                    reply.error(EACCES);
+                    return;
+                }
+
+                // Renaming within the same resource directory
+                // Get the resource and update its name in the index
+                if let Some(entry) = self.inode_index.get(inode) {
+                    if let VFSEntry::FHIRResource(resource) = entry {
+                        let resource_type = resource.resource_type.clone();
+                        let content = resource.content.clone();
+                        let new_id = newname_str.trim_end_matches(".json").to_string();
+
+                        // Remove old entry and insert new one with updated name
+                        self.inode_index.remove(inode);
+
+                        let new_resource =
+                            FHIRResource::new(inode, &resource_type, &new_id, content);
+
+                        self.inode_index.insert_resource(new_resource);
+                        self.inode_index.add_parent_child_relation(parent, inode);
+
+                        println!(
+                            "[rename]: {} -> {} in {}",
+                            name_str, newname_str, resource_type
+                        );
+
+                        reply.ok();
+                        return;
+                    }
+                }
+
+                reply.error(ENOENT);
                 return;
             }
 
