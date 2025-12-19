@@ -8,6 +8,6 @@ pub mod text_file;
 pub use directory::{Directory, DirectoryListing};
 pub use index::{IndexStats, InodeIndex, VFSEntry};
 pub use resource::FHIRResource;
-pub use search::Search;
+pub use search::SearchPath;
 pub use search_query::{SearchQuery, SearchResultGroup};
 pub use text_file::TextFile;

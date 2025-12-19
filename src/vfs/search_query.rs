@@ -6,16 +6,19 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub inode: u64,
-    pub query: String,           // The query string (directory name)
-    pub resource_type: String,   // The parent resource type
-    pub parent_inode: u64,       // The _search directory inode
+    pub path: String,          // Full path of the search query
+    pub query: String,         // The query string (directory name)
+    pub resource_type: String, // The parent resource type
+    pub parent_inode: u64,     // The _search directory inode
     pub created_at: SystemTime,
 }
 
 impl SearchQuery {
     pub fn new(inode: u64, query: String, resource_type: String, parent_inode: u64) -> Self {
+        let path = format!("/{}/_search/{}", resource_type, query);
         Self {
             inode,
+            path,
             query,
             resource_type,
             parent_inode,
@@ -49,15 +52,23 @@ impl SearchQuery {
 #[derive(Debug, Clone)]
 pub struct SearchResultGroup {
     pub inode: u64,
-    pub resource_type: String,   // The grouped resource type (e.g., "Patient")
-    pub parent_inode: u64,       // The SearchQuery inode
+    pub path: String,          // Full path of the search result group
+    pub resource_type: String, // The grouped resource type (e.g., "Patient")
+    pub parent_inode: u64,     // The SearchQuery inode
     pub created_at: SystemTime,
 }
 
 impl SearchResultGroup {
-    pub fn new(inode: u64, resource_type: String, parent_inode: u64) -> Self {
+    pub fn new(
+        inode: u64,
+        resource_type: String,
+        parent_inode: u64,
+        parent_query: &SearchQuery,
+    ) -> Self {
+        let path = format!("{}/{}", parent_query.path, resource_type);
         Self {
             inode,
+            path,
             resource_type,
             parent_inode,
             created_at: SystemTime::now(),

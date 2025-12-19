@@ -1,17 +1,17 @@
 use super::directory::Directory;
 use super::resource::FHIRResource;
-use super::search::Search;
+use super::search::SearchPath;
 use super::search_query::{SearchQuery, SearchResultGroup};
 use super::text_file::TextFile;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum VFSEntry {
-    Directory(Directory),
-    TextFile(TextFile),
-    FHIRResource(FHIRResource),
-    Search(Search),
-    SearchQuery(SearchQuery),
+    Directory(Directory),       // /Patient
+    TextFile(TextFile),         // /README.md
+    FHIRResource(FHIRResource), // /Patient/pt-1.json
+    SearchPath(SearchPath),     // /Patient/_search
+    SearchQuery(SearchQuery),   // /Patient/_search/gender=female
     SearchResultGroup(SearchResultGroup),
 }
 
@@ -42,9 +42,9 @@ impl InodeIndex {
         self.entries.insert(inode, VFSEntry::TextFile(text_file));
     }
 
-    pub fn insert_search(&mut self, search: Search) {
+    pub fn insert_search(&mut self, search: SearchPath) {
         let inode = search.inode;
-        self.entries.insert(inode, VFSEntry::Search(search));
+        self.entries.insert(inode, VFSEntry::SearchPath(search));
     }
 
     pub fn insert_search_query(&mut self, query: SearchQuery) {
@@ -54,7 +54,8 @@ impl InodeIndex {
 
     pub fn insert_search_result_group(&mut self, group: SearchResultGroup) {
         let inode = group.inode;
-        self.entries.insert(inode, VFSEntry::SearchResultGroup(group));
+        self.entries
+            .insert(inode, VFSEntry::SearchResultGroup(group));
     }
 
     pub fn insert_resource(&mut self, resource: FHIRResource) {
@@ -155,7 +156,7 @@ impl InodeIndex {
             VFSEntry::Directory(dir) => dir.get_attr(),
             VFSEntry::TextFile(file) => file.get_attr(),
             VFSEntry::FHIRResource(resource) => resource.get_attr(),
-            VFSEntry::Search(search) => search.get_attr(),
+            VFSEntry::SearchPath(search) => search.get_attr(),
             VFSEntry::SearchQuery(query) => query.get_attr(),
             VFSEntry::SearchResultGroup(group) => group.get_attr(),
         })
@@ -167,12 +168,20 @@ impl InodeIndex {
                 Some(VFSEntry::Directory(dir)) => dir.name == name,
                 Some(VFSEntry::TextFile(file)) => file.filename == name,
                 Some(VFSEntry::FHIRResource(resource)) => resource.filename == name,
-                Some(VFSEntry::Search(search)) => search.name == name,
+                Some(VFSEntry::SearchPath(search)) => search.path == name,
                 Some(VFSEntry::SearchQuery(query)) => query.query == name,
                 Some(VFSEntry::SearchResultGroup(group)) => group.resource_type == name,
                 None => false,
             }
         })
+    }
+
+    pub fn get_search_path_info(&self, inode: u64) -> Option<(String, u64)> {
+        if let Some(VFSEntry::SearchPath(search)) = self.get(inode) {
+            Some((search.resource_type.clone(), inode))
+        } else {
+            None
+        }
     }
 
     #[allow(dead_code)]
@@ -188,7 +197,7 @@ impl InodeIndex {
                 VFSEntry::Directory(_) => stats.directories += 1,
                 VFSEntry::TextFile(_) => stats.text_files += 1,
                 VFSEntry::FHIRResource(_) => stats.resources += 1,
-                VFSEntry::Search(_) => stats.search += 1,
+                VFSEntry::SearchPath(_) => stats.search += 1,
                 VFSEntry::SearchQuery(_) => stats.search_queries += 1,
                 VFSEntry::SearchResultGroup(_) => stats.search_result_groups += 1,
             }

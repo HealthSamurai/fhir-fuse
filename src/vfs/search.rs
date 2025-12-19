@@ -2,19 +2,21 @@ use fuser::FileAttr;
 use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone)]
-pub struct Search {
+pub struct SearchPath {
     pub inode: u64,
-    pub name: String,
+    pub path: String,
+    pub display_path: String,
     #[allow(dead_code)]
     pub resource_type: String,
     pub parent_inode: u64,
 }
 
-impl Search {
+impl SearchPath {
     pub fn new(inode: u64, resource_type: String, parent_inode: u64) -> Self {
         Self {
             inode,
-            name: "_search".to_string(),
+            path: "_search".to_string(),
+            display_path: format!("/{}/_search", resource_type).to_string(),
             resource_type,
             parent_inode,
         }
@@ -42,6 +44,6 @@ impl Search {
 
     #[allow(dead_code)]
     pub fn get_name(&self) -> &str {
-        &self.name
+        &self.path
     }
 }
