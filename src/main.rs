@@ -54,8 +54,6 @@ struct FhirFuse {
     lookup_counter: u64,
     readdir_counter: u64,
     operation_manager: OperationManager,
-    mount_uid: u32,
-    mount_gid: u32,
 }
 
 impl FhirFuse {
@@ -139,10 +137,6 @@ impl FhirFuse {
             operation_manager.add_operation_path(run_path);
         }
 
-        // Get current user's UID and GID
-        let mount_uid = unsafe { libc::getuid() };
-        let mount_gid = unsafe { libc::getgid() };
-
         FhirFuse {
             fhir_base_url,
             http_client,
@@ -165,8 +159,6 @@ impl FhirFuse {
             lookup_counter: 0,
             readdir_counter: 0,
             operation_manager,
-            mount_uid,
-            mount_gid,
         }
     }
 
@@ -248,7 +240,7 @@ impl FhirFuse {
     }
 
     fn get_attrs(&self, inode: u64) -> Option<FileAttr> {
-        self.inode_index.get_attr_with_ownership(inode, self.mount_uid, self.mount_gid)
+        self.inode_index.get_attr(inode)
     }
 
     /// Refresh search results for a given query inode (only if cache expired)
@@ -842,7 +834,7 @@ impl Filesystem for FhirFuse {
                                 execution.result = Some(content);
                                 execution.last_executed = Some(std::time::Instant::now());
 
-                                let attr = execution.get_attr_with_ownership(self.mount_uid, self.mount_gid);
+                                let attr = execution.get_attr();
 
                                 self.inode_index
                                     .insert_operation_execution(execution.clone());
@@ -1266,8 +1258,8 @@ impl Filesystem for FhirFuse {
                 kind: fuser::FileType::RegularFile,
                 perm: 0o644,
                 nlink: 1,
-                uid: self.mount_uid,
-                gid: self.mount_gid,
+                uid: 501,
+                gid: 20,
                 rdev: 0,
                 flags: 0,
                 blksize: 512,
@@ -1346,8 +1338,8 @@ impl Filesystem for FhirFuse {
                 kind: fuser::FileType::RegularFile,
                 perm: 0o644,
                 nlink: 1,
-                uid: self.mount_uid,
-                gid: self.mount_gid,
+                uid: 501,
+                gid: 20,
                 rdev: 0,
                 flags: 0,
                 blksize: 512,
@@ -1443,15 +1435,11 @@ impl Filesystem for FhirFuse {
                     match result {
                         Ok(_response) => {
                             println!("[FHIR] {}: {} {}", resource_type, resource_id, action);
-                            // Update the resource content in the index so reads return the new content
-                            if let Some(resource) = self.inode_index.get_fhir_resource_mut(ino) {
-                                resource.content = content_str.clone();
-                                resource.mtime = std::time::SystemTime::now();
-                            }
                             // Don't invalidate cache for newly created files - the inode is
                             // already in our index and invalidating would cause Finder to
                             // get ENOENT for the file it just created, leading to delete/retry cycles.
                             // For updates, also skip invalidation to keep the current inode valid.
+                            // The resource will be refreshed on the next manual refresh or remount.
                         }
                         Err(e) => {
                             println!(
@@ -1543,8 +1531,8 @@ impl Filesystem for FhirFuse {
                 kind: fuser::FileType::RegularFile,
                 perm: mode.map(|m| m as u16).unwrap_or(0o644),
                 nlink: 1,
-                uid: self.mount_uid,
-                gid: self.mount_gid,
+                uid: 501,
+                gid: 20,
                 rdev: 0,
                 flags: 0,
                 blksize: 512,
@@ -1572,10 +1560,7 @@ impl Filesystem for FhirFuse {
         }
     }
 
-    fn access(&mut self, _req: &Request, ino: u64, _mask: i32, reply: ReplyEmpty) {
-        // Always allow access - we handle permissions via file attributes
-        // The mask parameter indicates what type of access is being requested:
-        // F_OK (0) = existence, R_OK (4) = read, W_OK (2) = write, X_OK (1) = execute
+    fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
         if self.inode_index.get(ino).is_some() || self.temp_files.contains_key(&ino) {
             reply.ok();
         } else {
@@ -2001,7 +1986,14 @@ fn main() {
 
     let options = vec![
         MountOption::RW,
+        MountOption::CUSTOM("direct_io".to_string()),
+        MountOption::CUSTOM("max_readahead=0".to_string()),
+        MountOption::CUSTOM("sync_read".to_string()),
+        MountOption::Sync,
+        MountOption::DirSync,
         MountOption::FSName("fhir-fuse".to_string()),
+        MountOption::CUSTOM("noappledouble".to_string()),
+        MountOption::CUSTOM("noapplexattr".to_string()),
         MountOption::AllowOther, // Allow other users/apps to access
     ];
 

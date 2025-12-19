@@ -17,7 +17,7 @@ impl TextFile {
         }
     }
 
-    pub fn get_attr_with_ownership(&self, uid: u32, gid: u32) -> FileAttr {
+    pub fn get_attr(&self) -> FileAttr {
         let ts = SystemTime::now();
         let size = self.content.len() as u64;
         let blocks = (size + 511) / 512; // Calculate actual blocks needed
@@ -32,8 +32,8 @@ impl TextFile {
             kind: fuser::FileType::RegularFile,
             perm: 0o644,
             nlink: 1,
-            uid,
-            gid,
+            uid: 501,
+            gid: 20,
             rdev: 0,
             flags: 0,
             blksize: 512,
