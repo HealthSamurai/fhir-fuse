@@ -1576,6 +1576,11 @@ fn main() {
 
     let options = vec![
         MountOption::RW,
+        MountOption::CUSTOM("direct_io".to_string()),
+        MountOption::CUSTOM("max_readahead=0".to_string()),
+        MountOption::CUSTOM("sync_read".to_string()),
+        MountOption::Sync,
+        MountOption::DirSync,
         MountOption::FSName("fhir-fuse".to_string()),
         MountOption::CUSTOM("noappledouble".to_string()),
         MountOption::CUSTOM("noapplexattr".to_string()),
