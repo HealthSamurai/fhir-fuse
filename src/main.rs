@@ -1561,7 +1561,6 @@ impl Filesystem for FhirFuse {
     }
 
     fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
-        println!("[access]: ino={}, mask={}", ino, mask);
         if self.inode_index.get(ino).is_some() || self.temp_files.contains_key(&ino) {
             reply.ok();
         } else {
