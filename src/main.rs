@@ -12,14 +12,15 @@ use tokio::runtime::Runtime;
 
 mod vfs;
 use vfs::{
-    Directory, DirectoryListing, FHIRResource, IndexStats, InodeIndex, SearchPath, SearchQuery,
-    SearchResultGroup, TextFile, VFSEntry,
+    Directory, DirectoryListing, FHIRResource, IndexStats, InodeIndex, OperationExecution,
+    OperationManager, OperationPath, SearchPath, SearchQuery, SearchResultGroup, TextFile,
+    VFSEntry,
 };
 
 mod fhir;
 use fhir::{
-    delete_from_fhir_server, fetch_capability_statement, fetch_resources_parallel,
-    put_to_fhir_server, search_fhir_resources,
+    delete_from_fhir_server, execute_operation, fetch_capability_statement,
+    fetch_resources_parallel, put_to_fhir_server, search_fhir_resources,
 };
 
 mod inode_allocator;
@@ -50,6 +51,7 @@ struct FhirFuse {
     temp_files: HashMap<u64, (u64, String, Vec<u8>)>,
     lookup_counter: u64,
     readdir_counter: u64,
+    operation_manager: OperationManager,
 }
 
 impl FhirFuse {
@@ -119,6 +121,20 @@ impl FhirFuse {
             }
         }
 
+        let mut operation_manager = OperationManager::new();
+
+        // Add $run operation for ViewDefinition if it exists
+        if resource_directories.contains_key("ViewDefinition") {
+            let view_def_inode = resource_directories["ViewDefinition"];
+            let run_inode = inode_allocator.allocate();
+            let run_path =
+                OperationPath::new(run_inode, "ViewDefinition".to_string(), "run".to_string());
+
+            inode_index.insert_operation_path(run_path.clone());
+            inode_index.add_parent_child_relation(view_def_inode, run_inode);
+            operation_manager.add_operation_path(run_path);
+        }
+
         FhirFuse {
             fhir_base_url,
             http_client,
@@ -138,6 +154,7 @@ impl FhirFuse {
             temp_files: HashMap::new(),
             lookup_counter: 0,
             readdir_counter: 0,
+            operation_manager,
         }
     }
 
@@ -441,6 +458,8 @@ impl FhirFuse {
                     VFSEntry::FHIRResource(resource) => {
                         listing.add_file(resource.inode, &resource.filename)
                     }
+                    VFSEntry::OperationPath(op) => listing.add_dir(op.inode, &op.path),
+                    VFSEntry::OperationExecution(exec) => listing.add_file(exec.inode, &exec.path),
                 }
             }
         }
@@ -555,6 +574,9 @@ impl FhirFuse {
             if let Some(search) = self.inode_index.get_search_path(child_inode) {
                 listing.add_dir(search.inode, &search.path);
             }
+            if let Some(op) = self.inode_index.get_operation_path(child_inode) {
+                listing.add_dir(op.inode, &op.path);
+            }
         }
 
         // Add resource files sorted
@@ -625,6 +647,79 @@ impl Filesystem for FhirFuse {
                     }
                 }
 
+                // Handle operation directories ($run)
+                if let Some(operation_path) =
+                    self.operation_manager.get_operation_path(parent).cloned()
+                {
+                    // For operation directories, check if the file already exists
+                    if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
+                    {
+                        if let Some(attr) = self.get_attrs(child_inode) {
+                            reply.entry(&TTL, &attr, 0);
+                            return;
+                        }
+                    }
+
+                    // Parse the filename to see if it's a valid operation execution request
+                    if let Some((resource_id, format)) =
+                        OperationExecution::parse_filename(name_str)
+                    {
+                        // Execute the operation and create the file
+                        let client = self.http_client.clone();
+                        let base_url = self.fhir_base_url.clone();
+                        let rt_clone = operation_path.resource_type.clone();
+                        let rid_clone = resource_id.clone();
+                        let op_clone = format!("${}", operation_path.operation_name);
+                        let fmt_clone = format.clone();
+
+                        let result = self.runtime.block_on(async move {
+                            execute_operation(
+                                &client, &base_url, &rt_clone, &rid_clone, &op_clone, &fmt_clone,
+                            )
+                            .await
+                        });
+
+                        match result {
+                            Ok(content) => {
+                                // Create the operation execution entry
+                                let inode = self.inode_allocator.allocate();
+                                let mut execution = OperationExecution::new(
+                                    inode,
+                                    operation_path.resource_type.clone(),
+                                    resource_id.clone(),
+                                    operation_path.operation_name.clone(),
+                                    format.clone(),
+                                    parent,
+                                );
+                                execution.result = Some(content);
+                                execution.last_executed = Some(std::time::Instant::now());
+
+                                let attr = execution.get_attr();
+
+                                self.inode_index
+                                    .insert_operation_execution(execution.clone());
+                                self.inode_index.add_parent_child_relation(parent, inode);
+                                self.operation_manager.add_operation_execution(execution);
+
+                                println!(
+                                    "[lookup]: Operation {}/{} executed for {}.{}",
+                                    operation_path.resource_type,
+                                    operation_path.path,
+                                    resource_id,
+                                    format
+                                );
+                                reply.entry(&TTL, &attr, 0);
+                                return;
+                            }
+                            Err(e) => {
+                                println!("[lookup]: Failed to execute operation: {}", e);
+                                reply.error(ENOENT);
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 // Handle SearchResultGroup directories (resources within a type group)
                 if self.search_result_groups.contains_key(&parent) {
                     // Get the parent query inode and refresh it
@@ -682,7 +777,9 @@ impl Filesystem for FhirFuse {
             | Some(VFSEntry::TextFile(_))
             | Some(VFSEntry::SearchPath(_))
             | Some(VFSEntry::SearchQuery(_))
-            | Some(VFSEntry::SearchResultGroup(_)) => {
+            | Some(VFSEntry::SearchResultGroup(_))
+            | Some(VFSEntry::OperationPath(_))
+            | Some(VFSEntry::OperationExecution(_)) => {
                 if let Some(attr) = self.get_attrs(ino) {
                     reply.attr(&TTL, &attr);
                 } else {
@@ -737,7 +834,29 @@ impl Filesystem for FhirFuse {
                 let data = resource.read(offset, size);
                 reply.data(&data);
             }
-            _ => {
+            Some(VFSEntry::OperationExecution(exec)) => {
+                if let Some(result) = &exec.result {
+                    let offset = offset as usize;
+                    let size = size as usize;
+                    let data = if offset < result.len() {
+                        let end = std::cmp::min(offset + size, result.len());
+                        result[offset..end].as_bytes().to_vec()
+                    } else {
+                        vec![]
+                    };
+                    reply.data(&data);
+                } else {
+                    reply.error(ENODATA);
+                }
+            }
+            Some(VFSEntry::OperationPath(_))
+            | Some(VFSEntry::Directory(_))
+            | Some(VFSEntry::SearchPath(_))
+            | Some(VFSEntry::SearchQuery(_))
+            | Some(VFSEntry::SearchResultGroup(_)) => {
+                reply.error(libc::EISDIR);
+            }
+            None => {
                 if let Some((_, _filename, content)) = self.temp_files.get(&ino) {
                     let offset = offset as usize;
                     let size = size as usize;
@@ -789,6 +908,30 @@ impl Filesystem for FhirFuse {
             return;
         }
 
+        // Handle operation directories ($run)
+        if let Some(operation_path) = self.operation_manager.get_operation_path(ino) {
+            // Find parent from the index
+            let parent = self
+                .resource_directories
+                .get(&operation_path.resource_type)
+                .copied()
+                .unwrap_or(self.inode_allocator.root_inode);
+
+            let mut listing = self.create_directory_listing(ino, parent);
+
+            // Add existing operation execution files
+            let children = self.inode_index.get_children(ino);
+            for &child_inode in &children {
+                if let Some(exec) = self.inode_index.get_operation_execution(child_inode) {
+                    listing.add_file(exec.inode, &exec.path);
+                }
+            }
+
+            self.reply_with_listing(listing, offset, &mut reply);
+            reply.ok();
+            return;
+        }
+
         if let Some((resource_type, dir_inode)) = self
             .resource_directories
             .iter()
@@ -814,6 +957,17 @@ impl Filesystem for FhirFuse {
         reply: ReplyCreate,
     ) {
         let name_str = name.to_str().unwrap_or("");
+
+        // Check if parent is an operation directory ($run)
+        if self.operation_manager.get_operation_path(parent).is_some() {
+            // Operation files are created on-demand during lookup, not via create/touch
+            println!(
+                "[create]: Operation files are virtual and created on-demand: {}",
+                name_str
+            );
+            reply.error(EACCES);
+            return;
+        }
 
         let matching_resource = self
             .resource_directories
@@ -1132,6 +1286,10 @@ impl Filesystem for FhirFuse {
                 println!("[opendir]: inode: {}, path: {}", ino, group.path);
                 reply.opened(0, 0);
             }
+            Some(VFSEntry::OperationPath(op)) => {
+                println!("[opendir]: inode: {}, path: {}", ino, op.path);
+                reply.opened(0, 0);
+            }
             Some(_) => {
                 println!("[opendir]: inode: {}, error: not a directory", ino);
                 reply.error(libc::ENOTDIR);
@@ -1150,7 +1308,9 @@ impl Filesystem for FhirFuse {
         }
 
         match self.inode_index.get(ino) {
-            Some(VFSEntry::TextFile(_)) | Some(VFSEntry::FHIRResource(_)) => {
+            Some(VFSEntry::TextFile(_))
+            | Some(VFSEntry::FHIRResource(_))
+            | Some(VFSEntry::OperationExecution(_)) => {
                 reply.opened(0, 0);
             }
             Some(_) => {

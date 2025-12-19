@@ -86,10 +86,38 @@ Create folder in resource type directory with the search query as the folder nam
 │           └── result.(json|csv)  # Resource version 2
 └── ViewDefinition
     ├── $run/
-    │   ├── viewReference=blood_pressure/
-    │   │   └── result.csv                    # Resource version 2
-    │   └── viewReference=patient_demographics/
-    │       └── result.csv                    # Resource version 2
-    │── patient_demographics.json      # Each file is a FHIR resource
-    └── blood_pressure.json      # Each file is a FHIR resource
+    │   ├── <view-definition-id>.<format> # touch it -> RO file, collect data on read.
+    │── patient_demographics.json         # Each file is a FHIR resource
+    └── blood_pressure.json               # Each file is a FHIR resource
+```
+
+```rest
+POST /fhir/ViewDefinition/<view-definition-id>/$run
+content-type: application/json
+accept: application/json
+
+{
+   "resourceType":"Parameters",
+   "parameter":[
+      {
+         "name":"_format",
+         "valueCode":"<format>"
+      }
+   ]
+}
+```
+
+```rest
+POST /fhir/ViewDefinition/4d13c64c-0542-4fa8-926d-f0680d40d8f5/$run
+accept: text/csv
+
+{
+   "resourceType":"Parameters",
+   "parameter":[
+      {
+         "name":"_format",
+         "valueCode":"csv"
+      }
+   ]
+}
 ```

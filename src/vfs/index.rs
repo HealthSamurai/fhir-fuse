@@ -1,4 +1,5 @@
 use super::directory::Directory;
+use super::operation::{OperationExecution, OperationPath};
 use super::resource::FHIRResource;
 use super::search::SearchPath;
 use super::search_query::{SearchQuery, SearchResultGroup};
@@ -13,6 +14,8 @@ pub enum VFSEntry {
     SearchPath(SearchPath),     // /Patient/_search
     SearchQuery(SearchQuery),   // /Patient/_search/gender=female
     SearchResultGroup(SearchResultGroup),
+    OperationPath(OperationPath),           // /ViewDefinition/$run
+    OperationExecution(OperationExecution), // /ViewDefinition/$run/view-def-1.json
 }
 
 #[derive(Debug)]
@@ -56,6 +59,18 @@ impl InodeIndex {
         let inode = group.inode;
         self.entries
             .insert(inode, VFSEntry::SearchResultGroup(group));
+    }
+
+    pub fn insert_operation_path(&mut self, operation: OperationPath) {
+        let inode = operation.inode;
+        self.entries
+            .insert(inode, VFSEntry::OperationPath(operation));
+    }
+
+    pub fn insert_operation_execution(&mut self, execution: OperationExecution) {
+        let inode = execution.inode;
+        self.entries
+            .insert(inode, VFSEntry::OperationExecution(execution));
     }
 
     pub fn insert_resource(&mut self, resource: FHIRResource) {
@@ -159,6 +174,8 @@ impl InodeIndex {
             VFSEntry::SearchPath(search) => search.get_attr(),
             VFSEntry::SearchQuery(query) => query.get_attr(),
             VFSEntry::SearchResultGroup(group) => group.get_attr(),
+            VFSEntry::OperationPath(op) => op.get_attr(),
+            VFSEntry::OperationExecution(exec) => exec.get_attr(),
         })
     }
 
@@ -171,6 +188,8 @@ impl InodeIndex {
                 Some(VFSEntry::SearchPath(search)) => search.path == name,
                 Some(VFSEntry::SearchQuery(query)) => query.query == name,
                 Some(VFSEntry::SearchResultGroup(group)) => group.resource_type == name,
+                Some(VFSEntry::OperationPath(op)) => op.path == name,
+                Some(VFSEntry::OperationExecution(exec)) => exec.path == name,
                 None => false,
             }
         })
@@ -232,6 +251,22 @@ impl InodeIndex {
         }
     }
 
+    pub fn get_operation_path(&self, inode: u64) -> Option<&OperationPath> {
+        if let Some(VFSEntry::OperationPath(op)) = self.get(inode) {
+            Some(op)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_operation_execution(&self, inode: u64) -> Option<&OperationExecution> {
+        if let Some(VFSEntry::OperationExecution(exec)) = self.get(inode) {
+            Some(exec)
+        } else {
+            None
+        }
+    }
+
     #[allow(dead_code)]
     pub fn iter_entries(&self) -> impl Iterator<Item = (&u64, &VFSEntry)> {
         self.entries.iter()
@@ -248,6 +283,8 @@ impl InodeIndex {
                 VFSEntry::SearchPath(_) => stats.search += 1,
                 VFSEntry::SearchQuery(_) => stats.search_queries += 1,
                 VFSEntry::SearchResultGroup(_) => stats.search_result_groups += 1,
+                VFSEntry::OperationPath(_) => stats.operations += 1,
+                VFSEntry::OperationExecution(_) => stats.operation_executions += 1,
             }
         }
         stats.total = self.entries.len();
@@ -265,15 +302,17 @@ pub struct IndexStats {
     pub search: usize,
     pub search_queries: usize,
     pub search_result_groups: usize,
+    pub operations: usize,
+    pub operation_executions: usize,
 }
 
 impl std::fmt::Display for IndexStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Total: {}, Directories: {}, Text Files: {}, Resources: {}, Search: {}, Queries: {}, Groups: {}",
+            "Total: {}, Directories: {}, Text Files: {}, Resources: {}, Search: {}, Queries: {}, Groups: {}, Operations: {}, Executions: {}",
             self.total, self.directories, self.text_files, self.resources, self.search,
-            self.search_queries, self.search_result_groups
+            self.search_queries, self.search_result_groups, self.operations, self.operation_executions
         )
     }
 }

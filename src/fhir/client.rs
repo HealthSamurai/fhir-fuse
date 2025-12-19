@@ -1,4 +1,5 @@
 use reqwest::Client;
+use serde_json::json;
 
 #[allow(dead_code)]
 pub async fn get_from_fhir_server(
@@ -88,6 +89,73 @@ pub async fn delete_from_fhir_server(
     }
 }
 
+pub async fn execute_operation(
+    client: &Client,
+    fhir_base_url: &str,
+    resource_type: &str,
+    resource_id: &str,
+    operation: &str,
+    format: &str,
+) -> anyhow::Result<String> {
+    let url = format!(
+        "{}/{}/{}/{}",
+        fhir_base_url, resource_type, resource_id, operation
+    );
+
+    let parameters = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_format",
+                "valueCode": format
+            }
+        ]
+    });
+
+    // Set Accept header based on requested format
+    let accept_header = match format {
+        "csv" => "text/csv",
+        _ => "application/json", // Default to JSON
+    };
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", accept_header)
+        .body(parameters.to_string())
+        .send()
+        .await?;
+
+    let status = response.status();
+    let response_text = response.text().await?;
+
+    if status.is_success() {
+        // Format JSON responses with 2-space indentation
+        if format == "json" {
+            match serde_json::from_str::<serde_json::Value>(&response_text) {
+                Ok(json_value) => {
+                    match serde_json::to_string_pretty(&json_value) {
+                        Ok(formatted) => Ok(formatted),
+                        Err(_) => Ok(response_text), // Fall back to original if formatting fails
+                    }
+                }
+                Err(_) => Ok(response_text), // Fall back to original if parsing fails
+            }
+        } else {
+            Ok(response_text)
+        }
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to execute operation {} on {}/{}: HTTP {} - {}",
+            operation,
+            resource_type,
+            resource_id,
+            status,
+            response_text
+        ))
+    }
+}
+
 /// Search for resources using FHIR search API
 /// Returns resources grouped by resource type (important for _include/_revinclude)
 pub async fn search_fhir_resources(
@@ -139,7 +207,11 @@ pub async fn search_fhir_resources(
     }
 
     let total: usize = grouped_resources.values().map(|v| v.len()).sum();
-    println!("[FHIR] Search returned {} resources across {} types", total, grouped_resources.len());
+    println!(
+        "[FHIR] Search returned {} resources across {} types",
+        total,
+        grouped_resources.len()
+    );
 
     Ok(grouped_resources)
 }

@@ -77,6 +77,8 @@ impl ServerCapabilities {
                     }
                 }
             }
+            // HACK: because server is silence on it
+            capabilities.resources.push("ViewDefinition".to_owned())
         }
 
         capabilities.resources.sort();
@@ -120,10 +122,7 @@ pub async fn fetch_capability_statement(
 }
 
 /// Fetch a single page of resources and return (resources, next_page_url)
-async fn fetch_page(
-    client: &Client,
-    url: &str,
-) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+async fn fetch_page(client: &Client, url: &str) -> anyhow::Result<(Vec<Value>, Option<String>)> {
     let response = client.get(url).send().await?;
 
     if !response.status().is_success() {
@@ -154,9 +153,7 @@ async fn fetch_page(
     // Find "next" link for pagination
     let next_url = bundle["link"]
         .as_array()
-        .and_then(|links| {
-            links.iter().find(|link| link["relation"] == "next")
-        })
+        .and_then(|links| links.iter().find(|link| link["relation"] == "next"))
         .and_then(|link| link["url"].as_str())
         .map(|s| s.to_string());
 
@@ -171,7 +168,8 @@ async fn fetch_resources(
     fhir_base_url: &str,
     resource_type: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    let initial_url = format!("{}?_count={}",
+    let initial_url = format!(
+        "{}?_count={}",
         format!("{}/{}", fhir_base_url, resource_type),
         PAGE_SIZE
     );
@@ -285,15 +283,15 @@ fn extract_last_page(bundle: &Value) -> Option<usize> {
 }
 
 /// Fetch a single page by URL
-async fn fetch_page_by_url(
-    client: &Client,
-    url: &str,
-) -> anyhow::Result<Vec<Value>> {
+async fn fetch_page_by_url(client: &Client, url: &str) -> anyhow::Result<Vec<Value>> {
     let response = client.get(url).send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read body>".to_string());
         return Err(anyhow::anyhow!(
             "Failed to fetch\nURL: {}\nHTTP {}\nBody: {}",
             url,
@@ -351,7 +349,11 @@ pub async fn fetch_resources_parallel(
 
     // Get total count from bundle
     let total = bundle["total"].as_u64().unwrap_or(0) as usize;
-    let total_to_fetch = if total > 0 { total.min(MAX_RESOURCES) } else { MAX_RESOURCES };
+    let total_to_fetch = if total > 0 {
+        total.min(MAX_RESOURCES)
+    } else {
+        MAX_RESOURCES
+    };
 
     // Check if we have all resources already
     if first_resources.len() >= total_to_fetch {
@@ -380,9 +382,7 @@ pub async fn fetch_resources_parallel(
         let results: Vec<anyhow::Result<Vec<Value>>> = stream::iter(page_urls)
             .map(|url| {
                 let client = client.clone();
-                async move {
-                    fetch_page_by_url(&client, &url).await
-                }
+                async move { fetch_page_by_url(&client, &url).await }
             })
             .buffer_unordered(MAX_CONCURRENT_FETCHES)
             .collect()
