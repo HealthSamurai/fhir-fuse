@@ -1,6 +1,6 @@
 use super::directory::Directory;
 use super::operation::{OperationExecution, OperationPath};
-use super::resource::FHIRResource;
+use super::resource::{FHIRResource, ResourceVersion};
 use super::search::SearchPath;
 use super::search_query::{SearchQuery, SearchResultGroup};
 use super::text_file::TextFile;
@@ -8,11 +8,12 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum VFSEntry {
-    Directory(Directory),       // /Patient
-    TextFile(TextFile),         // /README.md
-    FHIRResource(FHIRResource), // /Patient/pt-1.json
-    SearchPath(SearchPath),     // /Patient/_search
-    SearchQuery(SearchQuery),   // /Patient/_search/gender=female
+    Directory(Directory),             // /Patient
+    TextFile(TextFile),               // /README.md
+    FHIRResource(FHIRResource),       // /Patient/pt-1.json
+    ResourceVersion(ResourceVersion), // /Patient/.pt-1/Patient-pt-1-version-1.json
+    SearchPath(SearchPath),           // /Patient/_search
+    SearchQuery(SearchQuery),         // /Patient/_search/gender=female
     SearchResultGroup(SearchResultGroup),
     OperationPath(OperationPath),           // /ViewDefinition/$run
     OperationExecution(OperationExecution), // /ViewDefinition/$run/view-def-1.json
@@ -84,6 +85,12 @@ impl InodeIndex {
             .push(inode);
 
         self.entries.insert(inode, VFSEntry::FHIRResource(resource));
+    }
+
+    pub fn insert_resource_version(&mut self, version: ResourceVersion) {
+        let inode = version.inode;
+        self.entries
+            .insert(inode, VFSEntry::ResourceVersion(version));
     }
 
     pub fn get(&self, inode: u64) -> Option<&VFSEntry> {
@@ -171,6 +178,7 @@ impl InodeIndex {
             VFSEntry::Directory(dir) => dir.get_attr(),
             VFSEntry::TextFile(file) => file.get_attr(),
             VFSEntry::FHIRResource(resource) => resource.get_attr(),
+            VFSEntry::ResourceVersion(version) => version.get_attr(),
             VFSEntry::SearchPath(search) => search.get_attr(),
             VFSEntry::SearchQuery(query) => query.get_attr(),
             VFSEntry::SearchResultGroup(group) => group.get_attr(),
@@ -185,6 +193,7 @@ impl InodeIndex {
                 Some(VFSEntry::Directory(dir)) => dir.name == name,
                 Some(VFSEntry::TextFile(file)) => file.filename == name,
                 Some(VFSEntry::FHIRResource(resource)) => resource.filename == name,
+                Some(VFSEntry::ResourceVersion(version)) => version.filename == name,
                 Some(VFSEntry::SearchPath(search)) => search.path == name,
                 Some(VFSEntry::SearchQuery(query)) => query.query == name,
                 Some(VFSEntry::SearchResultGroup(group)) => group.resource_type == name,
@@ -206,6 +215,14 @@ impl InodeIndex {
     pub fn get_directory(&self, inode: u64) -> Option<&Directory> {
         if let Some(VFSEntry::Directory(directory)) = self.get(inode) {
             Some(directory)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_resource_version(&self, inode: u64) -> Option<&ResourceVersion> {
+        if let Some(VFSEntry::ResourceVersion(version)) = self.get(inode) {
+            Some(version)
         } else {
             None
         }
@@ -280,6 +297,7 @@ impl InodeIndex {
                 VFSEntry::Directory(_) => stats.directories += 1,
                 VFSEntry::TextFile(_) => stats.text_files += 1,
                 VFSEntry::FHIRResource(_) => stats.resources += 1,
+                VFSEntry::ResourceVersion(_) => stats.resource_versions += 1,
                 VFSEntry::SearchPath(_) => stats.search += 1,
                 VFSEntry::SearchQuery(_) => stats.search_queries += 1,
                 VFSEntry::SearchResultGroup(_) => stats.search_result_groups += 1,
@@ -299,6 +317,7 @@ pub struct IndexStats {
     pub directories: usize,
     pub text_files: usize,
     pub resources: usize,
+    pub resource_versions: usize,
     pub search: usize,
     pub search_queries: usize,
     pub search_result_groups: usize,
@@ -310,8 +329,8 @@ impl std::fmt::Display for IndexStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Total: {}, Directories: {}, Text Files: {}, Resources: {}, Search: {}, Queries: {}, Groups: {}, Operations: {}, Executions: {}",
-            self.total, self.directories, self.text_files, self.resources, self.search,
+            "Total: {}, Directories: {}, Text Files: {}, Resources: {}, Versions: {}, Search: {}, Queries: {}, Groups: {}, Operations: {}, Executions: {}",
+            self.total, self.directories, self.text_files, self.resources, self.resource_versions, self.search,
             self.search_queries, self.search_result_groups, self.operations, self.operation_executions
         )
     }

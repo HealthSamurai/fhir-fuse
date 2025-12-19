@@ -19,7 +19,7 @@ use vfs::{
 
 mod fhir;
 use fhir::{
-    delete_from_fhir_server, execute_operation, fetch_capability_statement,
+    delete_from_fhir_server, execute_operation, fetch_capability_statement, fetch_resource_history,
     fetch_resources_parallel, put_to_fhir_server, search_fhir_resources,
 };
 
@@ -45,6 +45,8 @@ struct FhirFuse {
     search_query_load_times: HashMap<u64, std::time::Instant>, // query_inode -> last_refresh_time
     loaded_resources: HashSet<String>,
     resource_load_times: HashMap<String, std::time::Instant>,
+    history_directories: HashMap<u64, (String, String)>, // history_dir_inode -> (resource_type, resource_id)
+    history_load_times: HashMap<u64, std::time::Instant>, // history_dir_inode -> last_refresh_time
     inode_allocator: InodeAllocator,
     pending_writes: HashMap<u64, Vec<u8>>,
     created_files: HashMap<u64, (String, String)>,
@@ -148,6 +150,8 @@ impl FhirFuse {
             search_query_load_times: HashMap::new(),
             loaded_resources: HashSet::new(),
             resource_load_times: HashMap::new(),
+            history_directories: HashMap::new(),
+            history_load_times: HashMap::new(),
             inode_allocator,
             pending_writes: HashMap::new(),
             created_files: HashMap::new(),
@@ -186,7 +190,7 @@ impl FhirFuse {
 
         match result {
             Ok(resources) => {
-                // Clear old resources of this type
+                // Clear old resources of this type (but keep history directories)
                 self.inode_index.clear_resources_by_type(resource_type);
 
                 // Get the directory inode for this resource type
@@ -204,6 +208,25 @@ impl FhirFuse {
 
                     if let Some(dir) = dir_inode {
                         self.inode_index.add_parent_child_relation(dir, inode);
+
+                        // Create hidden history directory for this resource if it doesn't exist
+                        let history_dir_name = format!(".{}", id);
+                        let history_dir_inode = if let Some(existing_inode) =
+                            self.inode_index.find_child_by_name(dir, &history_dir_name)
+                        {
+                            existing_inode
+                        } else {
+                            let new_inode = self.inode_allocator.allocate();
+                            let history_dir = Directory::new(new_inode, history_dir_name);
+                            self.inode_index.insert_directory(history_dir);
+                            self.inode_index.add_parent_child_relation(dir, new_inode);
+                            new_inode
+                        };
+                        // Always track history directory (even if it already existed)
+                        self.history_directories.insert(
+                            history_dir_inode,
+                            (resource_type.to_string(), id.to_string()),
+                        );
                     }
                     count += 1;
                 }
@@ -458,6 +481,9 @@ impl FhirFuse {
                     VFSEntry::FHIRResource(resource) => {
                         listing.add_file(resource.inode, &resource.filename)
                     }
+                    VFSEntry::ResourceVersion(version) => {
+                        listing.add_file(version.inode, &version.filename)
+                    }
                     VFSEntry::OperationPath(op) => listing.add_dir(op.inode, &op.path),
                     VFSEntry::OperationExecution(exec) => listing.add_file(exec.inode, &exec.path),
                 }
@@ -557,6 +583,96 @@ impl FhirFuse {
         self.reply_with_listing(listing, offset, reply);
     }
 
+    fn load_resource_history(&mut self, history_dir_inode: u64) {
+        // Check if we need to refresh (cache duration)
+        let should_refresh = self
+            .history_load_times
+            .get(&history_dir_inode)
+            .map(|t| t.elapsed() > CACHE_DURATION)
+            .unwrap_or(true);
+
+        if !should_refresh {
+            return;
+        }
+
+        // Get resource info for this history directory
+        let (resource_type, resource_id) = match self.history_directories.get(&history_dir_inode) {
+            Some(info) => info.clone(),
+            None => {
+                println!(
+                    "[History] No info found for history directory {}",
+                    history_dir_inode
+                );
+                return;
+            }
+        };
+
+        println!(
+            "[History] Loading history for {}/{}",
+            resource_type, resource_id
+        );
+
+        let client = self.http_client.clone();
+        let base_url = self.fhir_base_url.clone();
+
+        let result: Result<Vec<serde_json::Value>, anyhow::Error> = self.runtime.block_on(async {
+            fetch_resource_history(&client, &base_url, &resource_type, &resource_id).await
+        });
+
+        match result {
+            Ok(versions) => {
+                // Clear existing version files for this history directory
+                let children = self.inode_index.get_children(history_dir_inode);
+                for &child_inode in &children {
+                    self.inode_index.remove(child_inode);
+                }
+                self.inode_index.clear_children(history_dir_inode);
+
+                // Add version files
+                for (index, version) in versions.iter().enumerate() {
+                    let version_id = version
+                        .get("meta")
+                        .and_then(|m: &serde_json::Value| m.get("versionId"))
+                        .and_then(|v: &serde_json::Value| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{}", index + 1));
+
+                    let content = serde_json::to_string_pretty(version).unwrap_or_default();
+
+                    let version_inode = self.inode_allocator.allocate();
+                    let version_entry = vfs::ResourceVersion::new(
+                        version_inode,
+                        &resource_type,
+                        &resource_id,
+                        &version_id,
+                        content,
+                    );
+
+                    self.inode_index.insert_resource_version(version_entry);
+                    self.inode_index
+                        .add_parent_child_relation(history_dir_inode, version_inode);
+                }
+
+                println!(
+                    "[History] Loaded {} versions for {}/{}",
+                    versions.len(),
+                    resource_type,
+                    resource_id
+                );
+
+                // Update cache timestamp
+                self.history_load_times
+                    .insert(history_dir_inode, std::time::Instant::now());
+            }
+            Err(e) => {
+                println!(
+                    "[History] Failed to fetch history for {}/{}: {}",
+                    resource_type, resource_id, e
+                );
+            }
+        }
+    }
+
     fn handle_resource_directory_readdir(
         &mut self,
         resource_type: &str,
@@ -579,8 +695,32 @@ impl FhirFuse {
             }
         }
 
-        // Add resource files sorted
-        self.add_sorted_files_to_listing(&mut listing, dir_inode);
+        // Add resource files and hidden history directories sorted
+        let children = self.inode_index.get_children(dir_inode);
+        let mut entries: Vec<(String, u64, bool)> = Vec::new();
+
+        for &child_inode in &children {
+            if let Some(resource) = self.inode_index.get_fhir_resource(child_inode) {
+                entries.push((resource.filename.clone(), child_inode, false));
+            } else if let Some(directory) = self.inode_index.get_directory(child_inode) {
+                // Only include directories that start with '.' (history directories)
+                if directory.name.starts_with('.') {
+                    entries.push((directory.name.clone(), child_inode, true));
+                }
+            }
+        }
+
+        // Sort by name
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, inode, is_dir) in entries {
+            if is_dir {
+                listing.add_dir(inode, name);
+            } else {
+                listing.add_file(inode, name);
+            }
+        }
+
         self.reply_with_listing(listing, offset, reply);
     }
 }
@@ -766,6 +906,26 @@ impl Filesystem for FhirFuse {
                         return;
                     }
                 }
+
+                // Handle history directories (directories starting with '.')
+                if let Some(directory) = self.inode_index.get_directory(parent) {
+                    if directory.name.starts_with('.') {
+                        // This is a history directory - load history if needed
+                        if self.history_directories.contains_key(&parent) {
+                            self.load_resource_history(parent);
+                        }
+
+                        // Now try to find the child (version file)
+                        if let Some(child_inode) =
+                            self.inode_index.find_child_by_name(parent, name_str)
+                        {
+                            if let Some(attr) = self.get_attrs(child_inode) {
+                                reply.entry(&TTL, &attr, 0);
+                                return;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -777,6 +937,7 @@ impl Filesystem for FhirFuse {
             Some(VFSEntry::FHIRResource(_))
             | Some(VFSEntry::Directory(_))
             | Some(VFSEntry::TextFile(_))
+            | Some(VFSEntry::ResourceVersion(_))
             | Some(VFSEntry::SearchPath(_))
             | Some(VFSEntry::SearchQuery(_))
             | Some(VFSEntry::SearchResultGroup(_))
@@ -921,6 +1082,17 @@ impl Filesystem for FhirFuse {
             | Some(VFSEntry::SearchResultGroup(_)) => {
                 reply.error(libc::EISDIR);
             }
+            Some(VFSEntry::ResourceVersion(version)) => {
+                let offset = offset as usize;
+                let size = size as usize;
+                let data = if offset < version.content.len() {
+                    let end = std::cmp::min(offset + size, version.content.len());
+                    version.content[offset..end].as_bytes().to_vec()
+                } else {
+                    vec![]
+                };
+                reply.data(&data);
+            }
             None => {
                 if let Some((_, _filename, content)) = self.temp_files.get(&ino) {
                     let offset = offset as usize;
@@ -1008,6 +1180,38 @@ impl Filesystem for FhirFuse {
             return;
         }
 
+        // Check if this is a history directory (starts with '.')
+        if let Some(directory) = self.inode_index.get_directory(ino) {
+            if directory.name.starts_with('.') {
+                // Load history if needed
+                if self.history_directories.contains_key(&ino) {
+                    self.load_resource_history(ino);
+                }
+
+                // Find parent directory to get proper parent inode
+                let parent = self
+                    .resource_directories
+                    .values()
+                    .find(|&&dir_inode| self.inode_index.get_children(dir_inode).contains(&ino))
+                    .copied()
+                    .unwrap_or(self.inode_allocator.root_inode);
+
+                let mut listing = self.create_directory_listing(ino, parent);
+
+                // Add version files
+                let children = self.inode_index.get_children(ino);
+                for &child_inode in &children {
+                    if let Some(version) = self.inode_index.get_resource_version(child_inode) {
+                        listing.add_file(version.inode, &version.filename);
+                    }
+                }
+
+                self.reply_with_listing(listing, offset, &mut reply);
+                reply.ok();
+                return;
+            }
+        }
+
         reply.error(ENOENT);
     }
 
@@ -1092,6 +1296,28 @@ impl Filesystem for FhirFuse {
 
             if let Some(&dir_inode) = self.resource_directories.get(&resource_type) {
                 self.inode_index.add_parent_child_relation(dir_inode, inode);
+
+                // Create hidden history directory for newly created resource if it doesn't exist
+                let resource_id = name_str.trim_end_matches(".json");
+                let history_dir_name = format!(".{}", resource_id);
+                let history_dir_inode = if let Some(existing_inode) = self
+                    .inode_index
+                    .find_child_by_name(dir_inode, &history_dir_name)
+                {
+                    existing_inode
+                } else {
+                    let new_inode = self.inode_allocator.allocate();
+                    let history_dir = Directory::new(new_inode, history_dir_name);
+                    self.inode_index.insert_directory(history_dir);
+                    self.inode_index
+                        .add_parent_child_relation(dir_inode, new_inode);
+                    new_inode
+                };
+                // Always track history directory (even if it already existed)
+                self.history_directories.insert(
+                    history_dir_inode,
+                    (resource_type.clone(), resource_id.to_string()),
+                );
             }
 
             let ts = std::time::SystemTime::now();
@@ -1373,7 +1599,9 @@ impl Filesystem for FhirFuse {
         }
 
         match self.inode_index.get(ino) {
-            Some(VFSEntry::TextFile(_)) | Some(VFSEntry::FHIRResource(_)) => {
+            Some(VFSEntry::TextFile(_))
+            | Some(VFSEntry::FHIRResource(_))
+            | Some(VFSEntry::ResourceVersion(_)) => {
                 reply.opened(0, 0);
             }
             Some(VFSEntry::OperationExecution(exec)) => {

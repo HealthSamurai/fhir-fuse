@@ -215,3 +215,56 @@ pub async fn search_fhir_resources(
 
     Ok(grouped_resources)
 }
+
+/// Fetch history of a specific resource
+pub async fn fetch_resource_history(
+    client: &Client,
+    fhir_base_url: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let url = format!(
+        "{}/{}/{}/_history",
+        fhir_base_url, resource_type, resource_id
+    );
+
+    println!("[FHIR] Fetching history: {}", url);
+
+    let response = client
+        .get(&url)
+        .header("Accept", "application/fhir+json")
+        .send()
+        .await?;
+
+    let status = response.status();
+    let response_text = response.text().await?;
+
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to fetch history from FHIR server: HTTP {} - {}",
+            status,
+            response_text
+        ));
+    }
+
+    let bundle: serde_json::Value = serde_json::from_str(&response_text)?;
+    let mut versions = Vec::new();
+
+    // Extract resources from the history bundle
+    if let Some(entries) = bundle.get("entry").and_then(|e| e.as_array()) {
+        for entry in entries {
+            if let Some(resource) = entry.get("resource") {
+                versions.push(resource.clone());
+            }
+        }
+    }
+
+    println!(
+        "[FHIR] Found {} versions for {}/{}",
+        versions.len(),
+        resource_type,
+        resource_id
+    );
+
+    Ok(versions)
+}

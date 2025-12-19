@@ -9,7 +9,7 @@ pub mod text_file;
 pub use directory::{Directory, DirectoryListing};
 pub use index::{IndexStats, InodeIndex, VFSEntry};
 pub use operation::{OperationExecution, OperationManager, OperationPath};
-pub use resource::FHIRResource;
+pub use resource::{FHIRResource, ResourceVersion};
 pub use search::SearchPath;
 pub use search_query::{SearchQuery, SearchResultGroup};
 pub use text_file::TextFile;

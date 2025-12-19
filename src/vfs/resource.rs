@@ -11,6 +11,16 @@ pub struct FHIRResource {
     pub mtime: SystemTime,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResourceVersion {
+    pub inode: u64,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub version_id: String,
+    pub filename: String,
+    pub content: String,
+}
+
 impl FHIRResource {
     pub fn new(
         inode: u64,
@@ -62,6 +72,52 @@ impl FHIRResource {
             content[offset..end].to_vec()
         } else {
             vec![]
+        }
+    }
+}
+
+impl ResourceVersion {
+    pub fn new(
+        inode: u64,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+        version_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        let resource_type = resource_type.into();
+        let resource_id = resource_id.into();
+        let version_id = version_id.into();
+        let filename = format!("{}.v{}.json", resource_id, version_id);
+
+        Self {
+            inode,
+            resource_type,
+            resource_id,
+            version_id,
+            filename,
+            content: content.into(),
+        }
+    }
+
+    pub fn get_attr(&self) -> FileAttr {
+        let ts = SystemTime::now();
+        let size = self.content.len() as u64;
+        FileAttr {
+            ino: self.inode,
+            size,
+            blocks: (size + 511) / 512,
+            atime: ts,
+            mtime: ts,
+            ctime: ts,
+            crtime: ts,
+            kind: fuser::FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: 501,
+            gid: 20,
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
         }
     }
 }
