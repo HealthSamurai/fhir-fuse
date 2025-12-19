@@ -19,10 +19,12 @@ impl TextFile {
 
     pub fn get_attr(&self) -> FileAttr {
         let ts = SystemTime::now();
+        let size = self.content.len() as u64;
+        let blocks = (size + 511) / 512; // Calculate actual blocks needed
         FileAttr {
             ino: self.inode,
-            size: self.content.len() as u64,
-            blocks: 1,
+            size,
+            blocks,
             atime: ts,
             mtime: ts,
             ctime: ts,

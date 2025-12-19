@@ -25,8 +25,8 @@ impl OperationPath {
         let ts = std::time::SystemTime::now();
         fuser::FileAttr {
             ino: self.inode,
-            size: 0,
-            blocks: 0,
+            size: 4096,
+            blocks: 1,
             atime: ts,
             mtime: ts,
             ctime: ts,
@@ -38,7 +38,7 @@ impl OperationPath {
             gid: 20,
             rdev: 0,
             flags: 0,
-            blksize: 512,
+            blksize: 4096,
         }
     }
 }

@@ -743,10 +743,12 @@ impl Filesystem for FhirFuse {
                 for (&inode, (temp_parent, filename, content)) in &self.temp_files {
                     if *temp_parent == parent && filename == name_str {
                         let ts = std::time::SystemTime::now();
+                        let size = content.len() as u64;
+                        let blocks = (size + 511) / 512;
                         let attr = FileAttr {
                             ino: inode,
-                            size: content.len() as u64,
-                            blocks: 1,
+                            size,
+                            blocks,
                             atime: ts,
                             mtime: ts,
                             ctime: ts,
@@ -778,8 +780,38 @@ impl Filesystem for FhirFuse {
             | Some(VFSEntry::SearchPath(_))
             | Some(VFSEntry::SearchQuery(_))
             | Some(VFSEntry::SearchResultGroup(_))
-            | Some(VFSEntry::OperationPath(_))
-            | Some(VFSEntry::OperationExecution(_)) => {
+            | Some(VFSEntry::OperationPath(_)) => {
+                if let Some(attr) = self.get_attrs(ino) {
+                    reply.attr(&TTL, &attr);
+                } else {
+                    reply.error(ENOENT);
+                }
+            }
+            Some(VFSEntry::OperationExecution(exec)) => {
+                // Ensure operation is executed if not cached
+                if exec.result.is_none() {
+                    let client = self.http_client.clone();
+                    let base_url = self.fhir_base_url.clone();
+                    let rt = exec.resource_type.clone();
+                    let rid = exec.resource_id.clone();
+                    let op = format!("${}", exec.operation_name);
+                    let fmt = exec.format.clone();
+
+                    let result = self.runtime.block_on(async move {
+                        execute_operation(&client, &base_url, &rt, &rid, &op, &fmt).await
+                    });
+
+                    if let Ok(content) = result {
+                        // Cache the result
+                        if let Some(exec_mut) =
+                            self.operation_manager.get_operation_execution_mut(ino)
+                        {
+                            exec_mut.result = Some(content);
+                            exec_mut.last_executed = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+
                 if let Some(attr) = self.get_attrs(ino) {
                     reply.attr(&TTL, &attr);
                 } else {
@@ -789,10 +821,12 @@ impl Filesystem for FhirFuse {
             None => {
                 if let Some((_, _, content)) = self.temp_files.get(&ino) {
                     let ts = std::time::SystemTime::now();
+                    let size = content.len() as u64;
+                    let blocks = (size + 511) / 512;
                     let attr = FileAttr {
                         ino,
-                        size: content.len() as u64,
-                        blocks: 1,
+                        size,
+                        blocks,
                         atime: ts,
                         mtime: ts,
                         ctime: ts,
@@ -835,19 +869,50 @@ impl Filesystem for FhirFuse {
                 reply.data(&data);
             }
             Some(VFSEntry::OperationExecution(exec)) => {
-                if let Some(result) = &exec.result {
-                    let offset = offset as usize;
-                    let size = size as usize;
-                    let data = if offset < result.len() {
-                        let end = std::cmp::min(offset + size, result.len());
-                        result[offset..end].as_bytes().to_vec()
-                    } else {
-                        vec![]
-                    };
-                    reply.data(&data);
+                // Execute operation if not cached
+                let result = if let Some(ref cached_result) = exec.result {
+                    cached_result.clone()
                 } else {
-                    reply.error(ENODATA);
-                }
+                    // Execute the operation
+                    let client = self.http_client.clone();
+                    let base_url = self.fhir_base_url.clone();
+                    let rt = exec.resource_type.clone();
+                    let rid = exec.resource_id.clone();
+                    let op = format!("${}", exec.operation_name);
+                    let fmt = exec.format.clone();
+
+                    let exec_result = self.runtime.block_on(async move {
+                        execute_operation(&client, &base_url, &rt, &rid, &op, &fmt).await
+                    });
+
+                    match exec_result {
+                        Ok(content) => {
+                            // Cache the result
+                            if let Some(exec_mut) =
+                                self.operation_manager.get_operation_execution_mut(ino)
+                            {
+                                exec_mut.result = Some(content.clone());
+                                exec_mut.last_executed = Some(std::time::Instant::now());
+                            }
+                            content
+                        }
+                        Err(e) => {
+                            println!("[read] Failed to execute operation: {}", e);
+                            reply.error(EIO);
+                            return;
+                        }
+                    }
+                };
+
+                let offset = offset as usize;
+                let size = size as usize;
+                let data = if offset < result.len() {
+                    let end = std::cmp::min(offset + size, result.len());
+                    result[offset..end].as_bytes().to_vec()
+                } else {
+                    vec![]
+                };
+                reply.data(&data);
             }
             Some(VFSEntry::OperationPath(_))
             | Some(VFSEntry::Directory(_))
@@ -1308,10 +1373,42 @@ impl Filesystem for FhirFuse {
         }
 
         match self.inode_index.get(ino) {
-            Some(VFSEntry::TextFile(_))
-            | Some(VFSEntry::FHIRResource(_))
-            | Some(VFSEntry::OperationExecution(_)) => {
+            Some(VFSEntry::TextFile(_)) | Some(VFSEntry::FHIRResource(_)) => {
                 reply.opened(0, 0);
+            }
+            Some(VFSEntry::OperationExecution(exec)) => {
+                // Ensure operation is executed if not cached
+                if exec.result.is_none() {
+                    let client = self.http_client.clone();
+                    let base_url = self.fhir_base_url.clone();
+                    let rt = exec.resource_type.clone();
+                    let rid = exec.resource_id.clone();
+                    let op = format!("${}", exec.operation_name);
+                    let fmt = exec.format.clone();
+
+                    let result = self.runtime.block_on(async move {
+                        execute_operation(&client, &base_url, &rt, &rid, &op, &fmt).await
+                    });
+
+                    match result {
+                        Ok(content) => {
+                            // Cache the result
+                            if let Some(exec_mut) =
+                                self.operation_manager.get_operation_execution_mut(ino)
+                            {
+                                exec_mut.result = Some(content);
+                                exec_mut.last_executed = Some(std::time::Instant::now());
+                            }
+                            reply.opened(0, 0);
+                        }
+                        Err(e) => {
+                            println!("[open] Failed to execute operation: {}", e);
+                            reply.error(EIO);
+                        }
+                    }
+                } else {
+                    reply.opened(0, 0);
+                }
             }
             Some(_) => {
                 reply.error(libc::EISDIR);
