@@ -40,7 +40,7 @@ impl FHIRResource {
         }
     }
 
-    pub fn get_attr(&self) -> FileAttr {
+    pub fn get_attr_with_ownership(&self, uid: u32, gid: u32) -> FileAttr {
         let size = self.content.len() as u64;
         let blocks = (size + 511) / 512; // Calculate actual blocks needed
         FileAttr {
@@ -54,8 +54,8 @@ impl FHIRResource {
             kind: fuser::FileType::RegularFile,
             perm: 0o644,
             nlink: 1,
-            uid: 501,
-            gid: 20,
+            uid,
+            gid,
             rdev: 0,
             flags: 0,
             blksize: 512,
@@ -99,7 +99,7 @@ impl ResourceVersion {
         }
     }
 
-    pub fn get_attr(&self) -> FileAttr {
+    pub fn get_attr_with_ownership(&self, uid: u32, gid: u32) -> FileAttr {
         let ts = SystemTime::now();
         let size = self.content.len() as u64;
         FileAttr {
@@ -113,8 +113,8 @@ impl ResourceVersion {
             kind: fuser::FileType::RegularFile,
             perm: 0o644,
             nlink: 1,
-            uid: 501,
-            gid: 20,
+            uid,
+            gid,
             rdev: 0,
             flags: 0,
             blksize: 512,

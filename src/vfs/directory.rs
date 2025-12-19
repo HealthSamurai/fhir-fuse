@@ -15,7 +15,7 @@ impl Directory {
         }
     }
 
-    pub fn get_attr(&self) -> FileAttr {
+    pub fn get_attr_with_ownership(&self, uid: u32, gid: u32) -> FileAttr {
         let ts = SystemTime::now();
         FileAttr {
             ino: self.inode,
@@ -28,8 +28,8 @@ impl Directory {
             kind: fuser::FileType::Directory,
             perm: 0o755,
             nlink: 2,
-            uid: 501,
-            gid: 20,
+            uid,
+            gid,
             rdev: 0,
             flags: 0,
             blksize: 4096,

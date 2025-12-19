@@ -177,16 +177,20 @@ impl InodeIndex {
     }
 
     pub fn get_attr(&self, inode: u64) -> Option<fuser::FileAttr> {
+        self.get_attr_with_ownership(inode, unsafe { libc::getuid() }, unsafe { libc::getgid() })
+    }
+
+    pub fn get_attr_with_ownership(&self, inode: u64, uid: u32, gid: u32) -> Option<fuser::FileAttr> {
         self.entries.get(&inode).map(|entry| match entry {
-            VFSEntry::Directory(dir) => dir.get_attr(),
-            VFSEntry::TextFile(file) => file.get_attr(),
-            VFSEntry::FHIRResource(resource) => resource.get_attr(),
-            VFSEntry::ResourceVersion(version) => version.get_attr(),
-            VFSEntry::SearchPath(search) => search.get_attr(),
-            VFSEntry::SearchQuery(query) => query.get_attr(),
-            VFSEntry::SearchResultGroup(group) => group.get_attr(),
-            VFSEntry::OperationPath(op) => op.get_attr(),
-            VFSEntry::OperationExecution(exec) => exec.get_attr(),
+            VFSEntry::Directory(dir) => dir.get_attr_with_ownership(uid, gid),
+            VFSEntry::TextFile(file) => file.get_attr_with_ownership(uid, gid),
+            VFSEntry::FHIRResource(resource) => resource.get_attr_with_ownership(uid, gid),
+            VFSEntry::ResourceVersion(version) => version.get_attr_with_ownership(uid, gid),
+            VFSEntry::SearchPath(search) => search.get_attr_with_ownership(uid, gid),
+            VFSEntry::SearchQuery(query) => query.get_attr_with_ownership(uid, gid),
+            VFSEntry::SearchResultGroup(group) => group.get_attr_with_ownership(uid, gid),
+            VFSEntry::OperationPath(op) => op.get_attr_with_ownership(uid, gid),
+            VFSEntry::OperationExecution(exec) => exec.get_attr_with_ownership(uid, gid),
         })
     }
 
@@ -241,6 +245,14 @@ impl InodeIndex {
 
     pub fn get_fhir_resource(&self, inode: u64) -> Option<&FHIRResource> {
         if let Some(VFSEntry::FHIRResource(resource)) = self.get(inode) {
+            Some(resource)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_fhir_resource_mut(&mut self, inode: u64) -> Option<&mut FHIRResource> {
+        if let Some(VFSEntry::FHIRResource(resource)) = self.entries.get_mut(&inode) {
             Some(resource)
         } else {
             None

@@ -21,7 +21,7 @@ impl OperationPath {
         }
     }
 
-    pub fn get_attr(&self) -> fuser::FileAttr {
+    pub fn get_attr_with_ownership(&self, uid: u32, gid: u32) -> fuser::FileAttr {
         let ts = std::time::SystemTime::now();
         fuser::FileAttr {
             ino: self.inode,
@@ -34,8 +34,8 @@ impl OperationPath {
             kind: fuser::FileType::Directory,
             perm: 0o755,
             nlink: 2,
-            uid: 501,
-            gid: 20,
+            uid,
+            gid,
             rdev: 0,
             flags: 0,
             blksize: 4096,
@@ -96,7 +96,7 @@ impl OperationExecution {
         None
     }
 
-    pub fn get_attr(&self) -> fuser::FileAttr {
+    pub fn get_attr_with_ownership(&self, uid: u32, gid: u32) -> fuser::FileAttr {
         let ts = std::time::SystemTime::now();
         let size = self.result.as_ref().map(|s| s.len() as u64).unwrap_or(0);
         fuser::FileAttr {
@@ -110,8 +110,8 @@ impl OperationExecution {
             kind: fuser::FileType::RegularFile,
             perm: 0o444, // Read-only
             nlink: 1,
-            uid: 501,
-            gid: 20,
+            uid,
+            gid,
             rdev: 0,
             flags: 0,
             blksize: 512,
