@@ -184,6 +184,54 @@ impl InodeIndex {
         }
     }
 
+    pub fn get_directory(&self, inode: u64) -> Option<&Directory> {
+        if let Some(VFSEntry::Directory(directory)) = self.get(inode) {
+            Some(directory)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_text_file(&self, inode: u64) -> Option<&TextFile> {
+        if let Some(VFSEntry::TextFile(text_file)) = self.get(inode) {
+            Some(text_file)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_fhir_resource(&self, inode: u64) -> Option<&FHIRResource> {
+        if let Some(VFSEntry::FHIRResource(resource)) = self.get(inode) {
+            Some(resource)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_search_path(&self, inode: u64) -> Option<&SearchPath> {
+        if let Some(VFSEntry::SearchPath(search)) = self.get(inode) {
+            Some(search)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_search_query(&self, inode: u64) -> Option<&SearchQuery> {
+        if let Some(VFSEntry::SearchQuery(query)) = self.get(inode) {
+            Some(query)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_search_result_group(&self, inode: u64) -> Option<&SearchResultGroup> {
+        if let Some(VFSEntry::SearchResultGroup(group)) = self.get(inode) {
+            Some(group)
+        } else {
+            None
+        }
+    }
+
     #[allow(dead_code)]
     pub fn iter_entries(&self) -> impl Iterator<Item = (&u64, &VFSEntry)> {
         self.entries.iter()
