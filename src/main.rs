@@ -213,6 +213,10 @@ impl FhirFuse {
             .unwrap_or(true);
 
         if !should_refresh {
+            println!(
+                "[Search] Skipping refresh for query_inode {} (cache still valid)",
+                query_inode
+            );
             return;
         }
 
@@ -284,6 +288,12 @@ impl FhirFuse {
                         };
 
                         // Add fresh resources to the group
+                        println!(
+                            "[Search] Adding {} {} resources to group {}",
+                            resources.len(),
+                            res_type,
+                            group_inode
+                        );
                         for resource in &resources {
                             let res_inode = self.inode_allocator.allocate();
                             let id = resource["id"].as_str().unwrap_or("unknown");
@@ -502,16 +512,26 @@ impl FhirFuse {
     }
 
     fn handle_search_result_group_readdir(
-        &self,
+        &mut self,
         ino: u64,
         offset: i64,
         reply: &mut ReplyDirectory,
     ) {
+        // Get the parent query inode and refresh it
         let parent = self
             .inode_index
             .get_search_result_group(ino)
             .map(|group| group.parent_inode)
             .unwrap_or(ino);
+
+        // Refresh the parent search query to ensure results are up-to-date
+        if parent != ino {
+            println!(
+                "[Search] Refreshing parent query {} for group {}",
+                parent, ino
+            );
+            self.refresh_search_query(parent);
+        }
 
         let mut listing = self.create_directory_listing(ino, parent);
         self.add_sorted_files_to_listing(&mut listing, ino);
@@ -589,6 +609,13 @@ impl Filesystem for FhirFuse {
 
                 // Handle SearchQuery directories (search results grouped by type)
                 if self.search_query_directories.contains_key(&parent) {
+                    // Refresh the search results before looking up
+                    println!(
+                        "[Lookup] Refreshing search query {} for lookup of '{}'",
+                        parent, name_str
+                    );
+                    self.refresh_search_query(parent);
+
                     if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
                     {
                         if let Some(attr) = self.get_attrs(child_inode) {
@@ -600,6 +627,15 @@ impl Filesystem for FhirFuse {
 
                 // Handle SearchResultGroup directories (resources within a type group)
                 if self.search_result_groups.contains_key(&parent) {
+                    // Get the parent query inode and refresh it
+                    if let Some(&query_inode) = self.search_result_groups.get(&parent) {
+                        println!(
+                            "[Lookup] Refreshing parent query {} for group {} lookup of '{}'",
+                            query_inode, parent, name_str
+                        );
+                        self.refresh_search_query(query_inode);
+                    }
+
                     if let Some(child_inode) = self.inode_index.find_child_by_name(parent, name_str)
                     {
                         if let Some(attr) = self.get_attrs(child_inode) {
