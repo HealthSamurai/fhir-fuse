@@ -107,14 +107,17 @@ impl InodeIndex {
         self.entries.contains_key(&inode)
     }
 
-    #[allow(dead_code)]
     pub fn remove(&mut self, inode: u64) -> Option<VFSEntry> {
         if let Some(entry) = self.entries.remove(&inode) {
-            // Clean up indexes
+            // Clean up resource type index
             if let VFSEntry::FHIRResource(ref resource) = entry {
                 if let Some(inodes) = self.resource_type_index.get_mut(&resource.resource_type) {
                     inodes.retain(|&i| i != inode);
                 }
+            }
+            // Clean up parent-child index - remove this inode from any parent's children
+            for children in self.parent_child_index.values_mut() {
+                children.retain(|&child| child != inode);
             }
             Some(entry)
         } else {

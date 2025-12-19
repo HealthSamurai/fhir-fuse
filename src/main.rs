@@ -1220,12 +1220,55 @@ impl Filesystem for FhirFuse {
         _req: &Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let name_str = name.to_str().unwrap_or("");
+        println!(
+            "[create]: name={}, parent={}, mode={:o}, flags={}",
+            name_str, parent, mode, flags
+        );
+
+        let is_temp_file = |name: &str| -> bool {
+            name.starts_with('.') && name.ends_with(".swp")
+                || name.starts_with('.') && name.ends_with(".swo")
+                || name.starts_with('.') && name.contains(".sw")
+                || name == "4913"
+                || name.starts_with(".")
+                || name.ends_with("~")
+        };
+
+        // Allow temp files (like .DS_Store) in any directory for Finder compatibility
+        if is_temp_file(name_str) {
+            let inode = self.inode_allocator.allocate();
+            self.temp_files
+                .insert(inode, (parent, name_str.to_string(), Vec::new()));
+
+            let ts = std::time::SystemTime::now();
+            let attr = FileAttr {
+                ino: inode,
+                size: 0,
+                blocks: 0,
+                atime: ts,
+                mtime: ts,
+                ctime: ts,
+                crtime: ts,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 501,
+                gid: 20,
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            };
+
+            println!("[create]: Temp file {} in parent {}", name_str, parent);
+            reply.created(&TTL, &attr, 0, inode, 0);
+            return;
+        }
 
         // Check if parent is an operation directory ($run)
         if self.operation_manager.get_operation_path(parent).is_some() {
@@ -1244,44 +1287,7 @@ impl Filesystem for FhirFuse {
             .find(|(_, &dir_inode)| parent == dir_inode)
             .map(|(resource_type, _)| resource_type.clone());
 
-        let is_temp_file = |name: &str| -> bool {
-            name.starts_with('.') && name.ends_with(".swp")
-                || name.starts_with('.') && name.ends_with(".swo")
-                || name.starts_with('.') && name.contains(".sw")
-                || name == "4913"
-                || name.starts_with(".")
-                || name.ends_with("~")
-        };
-
         if let Some(resource_type) = matching_resource {
-            if is_temp_file(name_str) {
-                let inode = self.inode_allocator.allocate();
-                self.temp_files
-                    .insert(inode, (parent, name_str.to_string(), Vec::new()));
-
-                let ts = std::time::SystemTime::now();
-                let attr = FileAttr {
-                    ino: inode,
-                    size: 0,
-                    blocks: 0,
-                    atime: ts,
-                    mtime: ts,
-                    ctime: ts,
-                    crtime: ts,
-                    kind: fuser::FileType::RegularFile,
-                    perm: 0o644,
-                    nlink: 1,
-                    uid: 501,
-                    gid: 20,
-                    rdev: 0,
-                    flags: 0,
-                    blksize: 512,
-                };
-
-                reply.created(&TTL, &attr, 0, inode, 0);
-                return;
-            }
-
             let inode = self.inode_allocator.allocate();
             self.pending_writes.insert(inode, Vec::new());
             self.created_files
@@ -1342,6 +1348,10 @@ impl Filesystem for FhirFuse {
             println!("[create]: {}/{}", resource_type, name_str);
             reply.created(&TTL, &attr, 0, inode, 0);
         } else {
+            println!(
+                "[create]: DENIED - parent {} is not a resource directory, file={}",
+                parent, name_str
+            );
             reply.error(EACCES);
         }
     }
@@ -1425,8 +1435,11 @@ impl Filesystem for FhirFuse {
                     match result {
                         Ok(_response) => {
                             println!("[FHIR] {}: {} {}", resource_type, resource_id, action);
-                            self.loaded_resources.remove(&resource_type);
-                            self.resource_load_times.remove(&resource_type);
+                            // Don't invalidate cache for newly created files - the inode is
+                            // already in our index and invalidating would cause Finder to
+                            // get ENOENT for the file it just created, leading to delete/retry cycles.
+                            // For updates, also skip invalidation to keep the current inode valid.
+                            // The resource will be refreshed on the next manual refresh or remount.
                         }
                         Err(e) => {
                             println!(
@@ -1547,16 +1560,33 @@ impl Filesystem for FhirFuse {
         }
     }
 
-    fn access(&mut self, _req: &Request, ino: u64, _mask: i32, reply: ReplyEmpty) {
+    fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+        println!("[access]: ino={}, mask={}", ino, mask);
         if self.inode_index.get(ino).is_some() || self.temp_files.contains_key(&ino) {
             reply.ok();
         } else {
+            println!("[access]: ENOENT for ino={}", ino);
             reply.error(ENOENT);
         }
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: fuser::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+        // Report 5 GB total, 4.5 GB free to allow drag-and-drop in Finder
+        let block_size: u32 = 4096;
+        let total_size: u64 = 5 * 1024 * 1024 * 1024; // 5 GB
+        let free_size: u64 = 4_500_000_000; // 4.5 GB free
+        let total_blocks = total_size / block_size as u64;
+        let free_blocks = free_size / block_size as u64;
+        reply.statfs(
+            total_blocks,  // total blocks
+            free_blocks,   // free blocks
+            free_blocks,   // available blocks (same as free for our purposes)
+            1_000_000,     // total inodes
+            999_000,       // free inodes
+            block_size,    // block size
+            255,           // max name length
+            block_size,    // fragment size
+        );
     }
 
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
@@ -1690,8 +1720,7 @@ impl Filesystem for FhirFuse {
                     match result {
                         Ok(_) => {
                             println!("[FHIR] {}: {} deleted", resource_type, resource_id);
-                            self.loaded_resources.remove(&resource_type);
-                            self.resource_load_times.remove(&resource_type);
+                            // Don't invalidate cache - we already removed the inode below
                         }
                         Err(e) => {
                             println!(
@@ -1709,6 +1738,130 @@ impl Filesystem for FhirFuse {
             self.created_files.remove(&inode);
             self.inode_index.remove(inode);
 
+            reply.ok();
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let name_str = name.to_str().unwrap_or("");
+        let newname_str = newname.to_str().unwrap_or("");
+
+        println!(
+            "[rename]: parent={}, name={}, newparent={}, newname={}",
+            parent, name_str, newparent, newname_str
+        );
+
+        // Check if this is a temp file being renamed
+        let temp_inode = self
+            .temp_files
+            .iter()
+            .find(|(_, (p, n, _))| *p == parent && n == name_str)
+            .map(|(&ino, _)| ino);
+
+        if let Some(inode) = temp_inode {
+            // Get the temp file content
+            if let Some((_, _, content)) = self.temp_files.remove(&inode) {
+                // Check if new parent is a resource directory
+                let mut target_resource_type: Option<String> = None;
+                for (res_type, &dir_inode) in &self.resource_directories {
+                    if dir_inode == newparent {
+                        target_resource_type = Some(res_type.clone());
+                        break;
+                    }
+                }
+
+                if let Some(resource_type) = target_resource_type {
+                    // This is a temp file being renamed to a FHIR resource file
+                    if newname_str.ends_with(".json") && !content.is_empty() {
+                        // Create the resource on the FHIR server
+                        let client = self.http_client.clone();
+                        let base_url = self.fhir_base_url.clone();
+
+                        if let Ok(content_str) = std::str::from_utf8(&content) {
+                            let result = self.runtime.block_on(async {
+                                put_to_fhir_server(
+                                    &client,
+                                    &base_url,
+                                    &resource_type,
+                                    newname_str,
+                                    content_str,
+                                )
+                                .await
+                            });
+
+                            match result {
+                                Ok(_) => {
+                                    println!(
+                                        "[FHIR] {}: {} created via rename",
+                                        resource_type, newname_str
+                                    );
+                                    // Add the resource to our inode index so it's visible
+                                    let new_inode = self.inode_allocator.allocate();
+                                    let resource_id = newname_str.trim_end_matches(".json");
+                                    let resource_entry = FHIRResource::new(
+                                        new_inode,
+                                        &resource_type,
+                                        resource_id,
+                                        content_str.to_string(),
+                                    );
+                                    self.inode_index.insert_resource(resource_entry);
+                                    self.inode_index.add_parent_child_relation(newparent, new_inode);
+                                    // Don't invalidate cache - keep the new inode valid
+                                    reply.ok();
+                                    return;
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "[FHIR] {}: {} create via rename failed: {}",
+                                        resource_type, newname_str, e
+                                    );
+                                    reply.error(EIO);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // For non-resource renames, just move the temp file
+                self.temp_files
+                    .insert(inode, (newparent, newname_str.to_string(), content));
+                reply.ok();
+                return;
+            }
+        }
+
+        // Handle renaming regular files (not temp files)
+        // For FHIR resources, we don't support renaming - files are synced with the server
+        if self.inode_index.find_child_by_name(parent, name_str).is_some() {
+            // Check if source is in a resource directory
+            let source_is_resource = self
+                .resource_directories
+                .values()
+                .any(|&dir| dir == parent);
+
+            if source_is_resource {
+                // Renaming FHIR resources is not supported
+                println!(
+                    "[rename]: Renaming FHIR resources not supported: {} -> {}",
+                    name_str, newname_str
+                );
+                reply.error(EACCES);
+                return;
+            }
+
+            // For non-resource files, just return OK (we don't actually rename in the index)
             reply.ok();
         } else {
             reply.error(ENOENT);
