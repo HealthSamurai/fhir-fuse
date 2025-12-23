@@ -11,6 +11,8 @@ Imagine a world where your FHIR server is just a folder on your computer. You ca
 
 Sounds too good to be true? Thanks to **Filesystem in Userspace (FUSE)**, it's real. FHIR FUSE creates a virtual filesystem that mirrors your FHIR server's data, making healthcare interoperability as simple as working with files.
 
+Project status: **proof of concept**
+
 ## 🚀 Quick Start with Docker
 
 The easiest way to get started is using Docker Compose, which includes everything you need:
