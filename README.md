@@ -18,8 +18,8 @@ Project status: **proof of concept**
 The easiest way to get started is using Docker Compose, which includes everything you need:
 
 ```bash
-# Set your architecture (x86_64 or aarch64)
-export TARGETARCH=aarch64
+# Build binary for Linux ARM64
+make build-linux-musl-arm64
 
 # Start all services (PostgreSQL, Aidbox FHIR server, and FHIR-FUSE)
 docker-compose up -d
@@ -27,7 +27,12 @@ docker-compose up -d
 # Access the mounted FHIR filesystem
 # On Linux: ls ./mnt/Patient
 # On macOS: see below for workarounds
+docker exec fhir-fuse-fhir-fuse-1 ls /mnt/fhir/Patient
 ```
+
+> ⚠️ **Warning**
+>  
+> You need to initialize the Aidbox instance by nagivating to http://localhost:8080 and logging in.
 
 **What's included:**
 

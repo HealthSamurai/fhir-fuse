@@ -20,6 +20,8 @@ services:
       - postgres
     ports:
       - 8080:8080
+    volumes:
+      - ./init-bundle.json:/tmp/bundle.json:ro
     environment:
       BOX_ADMIN_PASSWORD: admin
       BOX_BOOTSTRAP_FHIR_PACKAGES: hl7.fhir.r4.core#4.0.1
@@ -47,6 +49,7 @@ services:
       BOX_SETTINGS_MODE: read-write
       BOX_WEB_BASE_URL: http://localhost:8080
       BOX_WEB_PORT: 8080
+      BOX_INIT_BUNDLE: file:///tmp/bundle.json
     healthcheck:
       test: curl -f http://localhost:8080/health || exit 1
       interval: 5s

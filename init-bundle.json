@@ -1,0 +1,17 @@
+{
+  "type": "transaction",
+  "resourceType": "Bundle",
+  "entry": [
+    {
+      "request": {
+        "method": "PUT",
+        "url": "/AccessPolicy/allow-all"
+      },
+      "resource": {
+        "engine": "allow",
+        "id": "allow-all",
+        "resourceType": "AccessPolicy"
+      }
+    }
+  ]
+}
